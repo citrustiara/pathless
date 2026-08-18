@@ -33,13 +33,25 @@ export interface TerrainCell {
   readonly column: number;
   readonly coordinate: Coordinate;
   readonly elevationMeters: number;
-  /** Steepest grade to a neighbouring cell, in degrees. */
+  /**
+   * MEAN ground slope inside the cell, in degrees.
+   *
+   * The value is measured from the underlying elevation source and then reduced
+   * into one value for this routing cell.
+   */
   readonly slopeDegrees: number;
+  /**
+   * Steepest slope found anywhere inside the cell, in degrees.
+   *
+   * This uses the same source data and resolution as the mean slope and can still
+   * be high when the mean remains relatively gentle.
+   */
+  readonly maxSlopeDegrees: number;
   /**
    * Terrain Ruggedness Index in metres: the mean absolute elevation difference
    * to the eight neighbours. This measures the *shape* of the ground only and
    * says nothing about vegetation, deadfall, or undergrowth.
-   */
+  */
   readonly ruggednessMeters: number;
   /** Distance-decayed proximity to a mapped watercourse, in [0, 1]. */
   readonly waterRisk: number;

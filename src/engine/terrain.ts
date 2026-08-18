@@ -76,7 +76,8 @@ class GridTerrainModel implements TerrainModel {
     }
 
     const waterRisk = this.rasterizeWater(options.waterways ?? []);
-    this.cells = this.buildCells(elevations, waterRisk);
+    const { meanSlopeDegrees, maxSlopeDegrees } = this.buildSlopeFields(elevations);
+    this.cells = this.buildCells(elevations, waterRisk, meanSlopeDegrees, maxSlopeDegrees);
   }
 
   cellAt(row: number, column: number): TerrainCell | undefined {
@@ -157,27 +158,124 @@ class GridTerrainModel implements TerrainModel {
     return risk;
   }
 
-  private buildCells(elevations: Float32Array, waterRisk: Float32Array): TerrainCell[] {
-    const cells: TerrainCell[] = [];
-    const northSouthMeters = this.latitudeStep * METERS_PER_DEGREE_LATITUDE;
-    const eastWestMeters = this.longitudeStep * metersPerDegreeLongitude(this.center.lat);
-    const at = (row: number, column: number): number =>
+  /**
+   * Slope per routing cell, measured at the elevation source's own resolution.
+   *
+   * Fitting a gradient across the routing step would report whatever a 5 m or
+   * 25 m stride happens to average, which is not the ground a walker meets: a
+   * cell holding a short bank reads as gentle. So Horn's 3x3 gradient runs over
+   * the native grid instead, and each routing cell keeps both the mean of the
+   * native slopes inside it and the steepest one — the pair that separates a
+   * walkable shelf from a shelf with a scarp across it.
+   */
+  private buildSlopeFields(elevations: Float32Array): {
+    meanSlopeDegrees: Float32Array;
+    maxSlopeDegrees: Float32Array;
+  } {
+    const cellCount = this.rows * this.columns;
+    const nativeRows = this.elevation.rows;
+    const nativeColumns = this.elevation.columns;
+    const nativeData = this.elevation.data;
+    const nativeNorth = this.elevation.bounds.north;
+    const nativeWest = this.elevation.bounds.west;
+    const nativeLatitudeStep = this.elevation.latitudeStep;
+    const nativeLongitudeStep = this.elevation.longitudeStep;
+    const nativeNorthSouthMeters = nativeLatitudeStep * METERS_PER_DEGREE_LATITUDE;
+    const nativeEastWestMeters =
+      nativeLongitudeStep * metersPerDegreeLongitude(this.center.lat);
+    const nativeAt = (row: number, column: number): number => {
+      const clampedRow = clamp(row, 0, nativeRows - 1);
+      const clampedColumn = clamp(column, 0, nativeColumns - 1);
+      return nativeData[clampedRow * nativeColumns + clampedColumn];
+    };
+
+    const slopeSums = new Float32Array(cellCount);
+    const slopeCounts = new Int32Array(cellCount);
+    const slopeMax = new Float32Array(cellCount);
+
+    for (let nativeRow = 0; nativeRow < nativeRows; nativeRow += 1) {
+      const latitude = nativeNorth - nativeRow * nativeLatitudeStep;
+      if (latitude < this.bounds.south || latitude > this.bounds.north) continue;
+      for (let nativeColumn = 0; nativeColumn < nativeColumns; nativeColumn += 1) {
+        const longitude = nativeWest + nativeColumn * nativeLongitudeStep;
+        if (longitude < this.bounds.west || longitude > this.bounds.east) continue;
+
+        const dzdx = (
+          (nativeAt(nativeRow - 1, nativeColumn + 1) + 2 * nativeAt(nativeRow, nativeColumn + 1) + nativeAt(nativeRow + 1, nativeColumn + 1)) -
+          (nativeAt(nativeRow - 1, nativeColumn - 1) + 2 * nativeAt(nativeRow, nativeColumn - 1) + nativeAt(nativeRow + 1, nativeColumn - 1))
+        ) / (8 * nativeEastWestMeters);
+        const dzdy = (
+          (nativeAt(nativeRow + 1, nativeColumn - 1) + 2 * nativeAt(nativeRow + 1, nativeColumn) + nativeAt(nativeRow + 1, nativeColumn + 1)) -
+          (nativeAt(nativeRow - 1, nativeColumn - 1) + 2 * nativeAt(nativeRow - 1, nativeColumn) + nativeAt(nativeRow - 1, nativeColumn + 1))
+        ) / (8 * nativeNorthSouthMeters);
+        const slopeDegrees = (Math.atan(Math.hypot(dzdx, dzdy)) * 180) / Math.PI;
+
+        const row = clamp(
+          Math.round((this.bounds.north - latitude) / this.latitudeStep),
+          0,
+          this.rows - 1,
+        );
+        const column = clamp(
+          Math.round((longitude - this.bounds.west) / this.longitudeStep),
+          0,
+          this.columns - 1,
+        );
+        const index = row * this.columns + column;
+        slopeSums[index] += slopeDegrees;
+        slopeCounts[index] += 1;
+        if (slopeDegrees > slopeMax[index]) slopeMax[index] = slopeDegrees;
+      }
+    }
+
+    const meanSlopeDegrees = new Float32Array(cellCount);
+    const maxSlopeDegrees = new Float32Array(cellCount);
+    const routingNorthSouthMeters = this.latitudeStep * METERS_PER_DEGREE_LATITUDE;
+    const routingEastWestMeters = this.longitudeStep * metersPerDegreeLongitude(this.center.lat);
+    const routingAt = (row: number, column: number): number =>
       elevations[clamp(row, 0, this.rows - 1) * this.columns + clamp(column, 0, this.columns - 1)];
 
     for (let row = 0; row < this.rows; row += 1) {
       for (let column = 0; column < this.columns; column += 1) {
-        const centre = elevations[row * this.columns + column];
-        // Horn's method: a 3x3 weighted gradient, less noisy than two neighbours.
+        const index = row * this.columns + column;
+        if (slopeCounts[index] > 0) {
+          meanSlopeDegrees[index] = slopeSums[index] / slopeCounts[index];
+          maxSlopeDegrees[index] = slopeMax[index];
+          continue;
+        }
+        // No native sample landed here, so the source is coarser than the
+        // routing grid (or absent). Fall back to the routing step itself.
         const dzdx = (
-          (at(row - 1, column + 1) + 2 * at(row, column + 1) + at(row + 1, column + 1)) -
-          (at(row - 1, column - 1) + 2 * at(row, column - 1) + at(row + 1, column - 1))
-        ) / (8 * eastWestMeters);
+          (routingAt(row - 1, column + 1) + 2 * routingAt(row, column + 1) + routingAt(row + 1, column + 1)) -
+          (routingAt(row - 1, column - 1) + 2 * routingAt(row, column - 1) + routingAt(row + 1, column - 1))
+        ) / (8 * routingEastWestMeters);
         const dzdy = (
-          (at(row + 1, column - 1) + 2 * at(row + 1, column) + at(row + 1, column + 1)) -
-          (at(row - 1, column - 1) + 2 * at(row - 1, column) + at(row - 1, column + 1))
-        ) / (8 * northSouthMeters);
-        const slopeDegrees = (Math.atan(Math.hypot(dzdx, dzdy)) * 180) / Math.PI;
+          (routingAt(row + 1, column - 1) + 2 * routingAt(row + 1, column) + routingAt(row + 1, column + 1)) -
+          (routingAt(row - 1, column - 1) + 2 * routingAt(row - 1, column) + routingAt(row - 1, column + 1))
+        ) / (8 * routingNorthSouthMeters);
+        const fallback = (Math.atan(Math.hypot(dzdx, dzdy)) * 180) / Math.PI;
+        meanSlopeDegrees[index] = fallback;
+        maxSlopeDegrees[index] = fallback;
+      }
+    }
 
+    return { meanSlopeDegrees, maxSlopeDegrees };
+  }
+
+  private buildCells(
+    elevations: Float32Array,
+    waterRisk: Float32Array,
+    meanSlopeDegrees: Float32Array,
+    maxSlopeDegrees: Float32Array,
+  ): TerrainCell[] {
+    const cells: TerrainCell[] = [];
+    const at = (row: number, column: number): number =>
+      elevations[clamp(row, 0, this.rows - 1) * this.columns + clamp(column, 0, this.columns - 1)];
+    const indexFor = (row: number, column: number): number => row * this.columns + column;
+
+    for (let row = 0; row < this.rows; row += 1) {
+      for (let column = 0; column < this.columns; column += 1) {
+        const index = indexFor(row, column);
+        const centre = elevations[row * this.columns + column];
         let ruggedness = 0;
         for (const [rowOffset, columnOffset] of NEIGHBOUR_OFFSETS) {
           ruggedness += Math.abs(at(row + rowOffset, column + columnOffset) - centre);
@@ -188,9 +286,10 @@ class GridTerrainModel implements TerrainModel {
           column,
           coordinate: this.coordinateFor(row, column),
           elevationMeters: centre,
-          slopeDegrees,
+          slopeDegrees: meanSlopeDegrees[index],
+          maxSlopeDegrees: maxSlopeDegrees[index],
           ruggednessMeters: ruggedness / NEIGHBOUR_OFFSETS.length,
-          waterRisk: waterRisk[row * this.columns + column],
+          waterRisk: waterRisk[index],
         });
       }
     }
