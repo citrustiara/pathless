@@ -1555,7 +1555,24 @@ export const planOSMRoute = (
     routes.push(route);
   }
 
+  const requestPoints = [input.origin, input.destination, ...input.waypoints].filter(
+    (point): point is Coordinate => point !== undefined,
+  );
+  const outOfBoundsPoints = requestPoints.filter((point) => !terrain.contains(point));
   const warnings: string[] = [];
+
+  if (outOfBoundsPoints.length > 0) {
+    // The elevation grid clamps to its edge rather than failing, so a point
+    // outside the survey still returns a height — just not a measured one.
+    // Saying so is the whole point: the alternative is a confident number.
+    const count = outOfBoundsPoints.length;
+    warnings.push(
+      `${count} ${count === 1 ? "point sits" : "points sit"} outside the surveyed area. ` +
+      "Height there is read from the nearest edge of the survey rather than measured, " +
+      "so climb and grade across those stretches are not evidence.",
+    );
+  }
+
   if (routes.length > 0 && !terrain.hasElevation) {
     warnings.push("Elevation data is unavailable, so climb and time figures assume flat ground.");
   }

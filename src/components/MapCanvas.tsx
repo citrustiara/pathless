@@ -389,6 +389,13 @@ export function MapCanvas({
           onContextMenu={setContextMenu}
         />
 
+        {/*
+          The edge of the surveyed area. Deliberately not interactive: a tooltip
+          would need it to be, and its hit area is a hairline sitting exactly
+          where someone placing a point near the edge would click. What the line
+          means is said in the route notes instead, which appear precisely when a
+          point crosses it.
+        */}
         <Rectangle bounds={DATA_BOUNDS} pathOptions={{ color: "#6f8794", weight: 1, opacity: 0.4, fill: false, dashArray: "4 5" }} interactive={false} />
 
         <OSMFeatureLayer visible={layers.paths} />

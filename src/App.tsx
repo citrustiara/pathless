@@ -93,6 +93,7 @@ const buildNotes = (
   request: RouteRequest,
   terrain: TerrainModel,
   elevation: ElevationGrid | undefined,
+  warnings: string[],
 ): string[] => {
   const mapped = shareOf(route.mappedDistanceMeters, route.distanceMeters);
   const notes = [
@@ -105,7 +106,7 @@ const buildNotes = (
     terrain.hasElevation
       ? `Climb, grade, and time come from ${elevation?.attribution ?? "a public elevation model"}.`
       : "Elevation was unavailable, so climb and grade are reported as zero rather than guessed.",
-    "Ground cover is not modelled: undergrowth, deadfall, and fences will not appear here.",
+    "Undergrowth and deadfall are not modelled. Walls, fences, and hedges are, but only where OpenStreetMap maps them: the route avoids those except at a mapped gate, and knows nothing of the ones nobody has recorded.",
     request.settings.allowStreetCrossing
       ? "Street crossings are allowed anywhere, including where no crossing is mapped."
       : "Streets are only crossed where OpenStreetMap maps a crossing.",
@@ -113,7 +114,7 @@ const buildNotes = (
   if (route.waterDistanceMeters > 0) {
     notes.push(`${Math.round(route.waterDistanceMeters)} m runs close to a mapped watercourse.`);
   }
-  return notes;
+  return [...warnings, ...notes];
 };
 
 const buildView = (
@@ -154,7 +155,7 @@ const buildView = (
       : `${shareOf(primary.mappedDistanceMeters, primary.distanceMeters)}% on mapped ways`,
     route: primary,
     alternatives: result.routes.filter((_, index) => index !== chosen),
-    notes: buildNotes(primary, request, terrain, elevation),
+    notes: buildNotes(primary, request, terrain, elevation, result.warnings),
   };
 };
 
