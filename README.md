@@ -11,6 +11,8 @@ The guiding rule is that the engine does not score what it cannot measure. Eleva
 - Routes over a checked-in OpenStreetMap snapshot of Sopocka, joining mapped ways with connectors searched across a 5 m terrain grid. Each off-trail step may reach up to two cells, which gives the search 16 headings rather than the 8 a plain neighbour grid allows, so a line that does not happen to run at a multiple of 45 degrees comes out as that line instead of as a staircase approximating it.
 - Costs every metre as estimated travel time, from a normalised Tobler hiking curve applied to the real local grade, scaled by the way's mapped surface and by the chosen travel style.
 - Enforces limits that mean something on the ground: a maximum grade along the route, a maximum length for any single off-trail stretch, and explicit permissions for crossing streets, walking along streets, and entering mapped watercourses.
+- Refuses to draw an off-trail line through a mapped wall, fence or hedge unless OpenStreetMap records a gate or stile there. Guard rails, bollards and ditches are imported too but do not block, because they stop a vehicle rather than someone on foot. Only mapped barriers are known; an unrecorded fence is still an unrecorded fence.
+- Says when a start, target or waypoint falls outside the surveyed area, because the elevation grid clamps to its nearest edge rather than failing, and a clamped height is not a measured one.
 - Offers up to three honestly labelled options: balanced, most direct, and stay-on-trails. Objectives that agree on the same line are offered once, not relabelled.
 - Reports distance, moving time, climb, steepest grade, an elevation profile, and a surface breakdown taken from OSM tags.
 - Exports GPX and GeoJSON with elevation, and keeps the full request in the URL so a route can be shared or reloaded.
@@ -92,7 +94,8 @@ OSM snapshot ──► routing graph ─────┴─► TerrainModel ─�
 
 - [`src/engine/elevation.ts`](src/engine/elevation.ts) fetches and decodes terrarium tiles into a latitude/longitude-regular grid, and derives contour polylines with marching squares.
 - [`src/engine/terrain.ts`](src/engine/terrain.ts) lays a 5 m routing grid over the area, filling it with elevation, slope, a terrain ruggedness index, and proximity to mapped watercourses. Slope is measured on the elevation source's own grid and then aggregated per cell as both a mean and a maximum, not fitted across the routing step: over this area, measuring at a 25 m stride left a thousand cells reading as gentle ground while holding a slope past 20 degrees somewhere inside them.
-- [`src/engine/osm-router.ts`](src/engine/osm-router.ts) builds the way graph, derives street-crossing evidence from where paths and roads actually intersect, and searches the combined network.
+- [`src/engine/osm-router.ts`](src/engine/osm-router.ts) builds the way graph, derives street-crossing evidence from where paths and roads actually intersect, holds the mapped barriers and their gates as a separate layer that off-trail lines may not cross, and searches the combined network.
+- [`scripts/sopocka.overpass`](scripts/sopocka.overpass) is the query behind the snapshot, and [`scripts/import-osm.mjs`](scripts/import-osm.mjs) bakes its response.
 - [`src/engine/geo.ts`](src/engine/geo.ts) holds the small-area geodesy shared by all of the above.
 
 ### When elevation is unavailable
