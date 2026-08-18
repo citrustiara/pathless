@@ -274,7 +274,9 @@ export function App() {
   const [waypoints, setWaypoints] = useState<MapPoint[]>(initial.waypoints ?? []);
   const [placementMode, setPlacementMode] = useState<PlacementMode>(null);
   const [layers, setLayers] = useState<MapLayers>(INITIAL_LAYERS);
-  const [detailsHidden, setDetailsHidden] = useState(false);
+  // On a phone the details panel would cover most of the map, so it starts
+  // collapsed to the chip there.
+  const [detailsHidden, setDetailsHidden] = useState(() => window.innerWidth < 820);
   const [railCollapsed, setRailCollapsed] = useState(false);
   const [section, setSection] = useState<"explorer" | "saved">("explorer");
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
@@ -348,12 +350,12 @@ export function App() {
   const handleMapClick = useCallback((point: MapPoint) => {
     if (placementMode === "start") setStart(point);
     if (placementMode === "target") setTarget(point);
-    if (placementMode === "waypoint") {
+    if (placementMode === "waypoint" && mode === "design") {
       setWaypoints((current) => (current.length < MAX_WAYPOINTS ? [...current, point] : current));
     }
     // The placement mode deliberately stays active so several points can be
     // dropped in a row; Esc or the Done button ends it.
-  }, [placementMode]);
+  }, [mode, placementMode]);
 
   const handleMovePoint = useCallback(
     (kind: "start" | "target" | "waypoint", index: number, point: MapPoint) => {
@@ -365,6 +367,17 @@ export function App() {
     },
     [],
   );
+
+  const handleAddWaypoint = useCallback((point: MapPoint) => {
+    setMode("design");
+    setWaypoints((current) => (current.length < MAX_WAYPOINTS ? [...current, point] : current));
+  }, []);
+
+  const handleSwapEnds = useCallback(() => {
+    setStart(target);
+    setTarget(start);
+    setWaypoints((current) => [...current].reverse());
+  }, [start, target]);
 
   const handleReset = useCallback(() => {
     setMode("destination");
@@ -520,6 +533,7 @@ export function App() {
               onPlacementModeChange={setPlacementMode}
               onClearWaypoint={(index) =>
                 setWaypoints((current) => current.filter((_, position) => position !== index))}
+              onSwapEnds={handleSwapEnds}
               onReset={handleReset}
             />
           )}
@@ -543,6 +557,7 @@ export function App() {
               onMapClick={handleMapClick}
               onPlacementModeChange={setPlacementMode}
               onMovePoint={handleMovePoint}
+              onAddWaypoint={handleAddWaypoint}
               onSelectAlternative={handleSelectAlternative}
             >
               <RouteSummary

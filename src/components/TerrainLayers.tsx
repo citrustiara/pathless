@@ -14,14 +14,18 @@ type LayerProps = {
   visible: boolean;
 };
 
-/** Hypsometric ramp, low ground to high ground. */
+/**
+ * Hypsometric ramp, low ground to high ground. The stops are deliberately
+ * light: this layer multiplies over the base map, so a saturated ramp would
+ * flatten the map's own colours instead of adding relief to them. The depth
+ * comes from the hillshade below, not from the hue.
+ */
 const RAMP: Array<[number, [number, number, number]]> = [
-  [0, [126, 168, 142]],
-  [0.24, [162, 190, 145]],
-  [0.46, [200, 208, 160]],
-  [0.66, [226, 213, 168]],
-  [0.84, [216, 188, 152]],
-  [1, [196, 165, 143]],
+  [0, [186, 208, 196]],
+  [0.3, [200, 212, 190]],
+  [0.6, [216, 212, 186]],
+  [0.82, [222, 205, 178]],
+  [1, [218, 192, 170]],
 ];
 
 const rampColor = (position: number): [number, number, number] => {
@@ -82,8 +86,9 @@ const renderTerrainRaster = (grid: ElevationGrid, scale: number): string => {
         Math.sin(SUN_ALTITUDE) * Math.cos(slope) +
           Math.cos(SUN_ALTITUDE) * Math.sin(slope) * Math.cos(AZIMUTH - aspect),
       );
-      // Keep the shading gentle so the base map stays readable underneath.
-      const lighting = 0.72 + shade * 0.56;
+      // A wider lighting range gives the relief its depth; the base map keeps
+      // its own colours because the ramp above barely tints.
+      const lighting = 0.6 + shade * 0.74;
       const [red, green, blue] = rampColor((centre - grid.minElevation) / relief);
       const edge = Math.min(
         x / featherX, (width - 1 - x) / featherX,
@@ -121,7 +126,7 @@ export function ElevationTintLayer({ grid, visible }: LayerProps) {
         [grid.bounds.south - halfLatitude, grid.bounds.west - halfLongitude],
         [grid.bounds.north + halfLatitude, grid.bounds.east + halfLongitude],
       ],
-      { opacity: 0.46, interactive: false, className: "elevation-tint-overlay", pane: "tilePane" },
+      { opacity: 0.62, interactive: false, className: "elevation-tint-overlay", pane: "tilePane" },
     ).addTo(map);
     return () => {
       overlay.remove();

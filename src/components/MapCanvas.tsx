@@ -42,6 +42,7 @@ type MapCanvasProps = {
   onMapClick: (point: MapPoint) => void;
   onPlacementModeChange: (mode: PlacementMode) => void;
   onMovePoint: (kind: "start" | "target" | "waypoint", index: number, point: MapPoint) => void;
+  onAddWaypoint: (point: MapPoint) => void;
   onSelectAlternative: (index: number) => void;
   children?: ReactNode;
 };
@@ -107,6 +108,27 @@ function MapReady() {
 }
 
 /**
+ * Leaflet only watches the window, so collapsing the rail or any other layout
+ * change would leave the map rendering at its old size.
+ */
+function MapResizeWatcher() {
+  const map = useMap();
+  useEffect(() => {
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => map.invalidateSize({ animate: false }));
+    });
+    observer.observe(map.getContainer());
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [map]);
+  return null;
+}
+
+/**
  * The HUD lives inside the Leaflet container so it can use the map context.
  * Without this, a click on a button would also pan or zoom the map underneath.
  */
@@ -141,19 +163,37 @@ function FitRoute({ route, detailsHidden }: { route?: OSMRoute; detailsHidden: b
   return null;
 }
 
+export type MapContextMenu = {
+  x: number;
+  y: number;
+  lat: number;
+  lng: number;
+};
+
 function MapInteractions({
   placementMode,
   onMapClick,
   onCursorChange,
+  onContextMenu,
 }: {
   placementMode: PlacementMode;
   onMapClick: (point: MapPoint) => void;
   onCursorChange: (point: Coordinate | null) => void;
+  onContextMenu: (menu: MapContextMenu | null) => void;
 }) {
   useMapEvents({
     click: (event) => {
+      onContextMenu(null);
       if (placementMode) onMapClick({ lat: event.latlng.lat, lng: event.latlng.lng });
     },
+    contextmenu: (event) => onContextMenu({
+      x: event.containerPoint.x,
+      y: event.containerPoint.y,
+      lat: event.latlng.lat,
+      lng: event.latlng.lng,
+    }),
+    movestart: () => onContextMenu(null),
+    zoomstart: () => onContextMenu(null),
     mousemove: (event) => onCursorChange({ lat: event.latlng.lat, lng: event.latlng.lng }),
     mouseout: () => onCursorChange(null),
   });
@@ -235,10 +275,12 @@ export function MapCanvas({
   onMapClick,
   onPlacementModeChange,
   onMovePoint,
+  onAddWaypoint,
   onSelectAlternative,
   children,
 }: MapCanvasProps) {
   const [cursor, setCursor] = useState<Coordinate | null>(null);
+  const [contextMenu, setContextMenu] = useState<MapContextMenu | null>(null);
   const [layersOpen, setLayersOpen] = useState(false);
   const layersRef = useRef<HTMLDivElement>(null);
 
@@ -292,11 +334,13 @@ export function MapCanvas({
         )}
 
         <MapReady />
+        <MapResizeWatcher />
         <FitRoute route={primary} detailsHidden={detailsHidden} />
         <MapInteractions
           placementMode={placementMode}
           onMapClick={onMapClick}
           onCursorChange={setCursor}
+          onContextMenu={setContextMenu}
         />
 
         <Rectangle bounds={DATA_BOUNDS} pathOptions={{ color: "#6f8794", weight: 1, opacity: 0.4, fill: false, dashArray: "4 5" }} interactive={false} />
@@ -420,7 +464,12 @@ export function MapCanvas({
                   className={`map-place-button ${placementMode === kind ? "map-place-button-active" : ""}`}
                   type="button"
                   aria-pressed={placementMode === kind}
-                  disabled={kind === "target" && mode === "nearest"}
+                  disabled={(kind === "target" && mode === "nearest") || (kind === "waypoint" && mode !== "design")}
+                  title={kind === "waypoint" && mode !== "design"
+                    ? "Switch to Design route to place waypoints"
+                    : kind === "target" && mode === "nearest"
+                      ? "Nearest path mode does not use a target"
+                      : undefined}
                   onClick={() => togglePlacement(kind)}
                 >
                   <span className={`place-dot place-dot-${kind}`} />
@@ -502,6 +551,34 @@ export function MapCanvas({
           </div>
 
           <div className="overlay-corner overlay-bottom-right">{children}</div>
+
+          {contextMenu && (
+            <div
+              className="map-context-menu"
+              style={{ left: contextMenu.x, top: contextMenu.y }}
+              role="menu"
+            >
+              <button type="button" role="menuitem" onClick={() => { onMovePoint("start", 0, contextMenu); setContextMenu(null); }}>
+                <span className="place-dot place-dot-start" />Start here
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                disabled={mode === "nearest"}
+                title={mode === "nearest" ? "Nearest path mode does not use a target" : undefined}
+                onClick={() => { onMovePoint("target", 0, contextMenu); setContextMenu(null); }}
+              >
+                <span className="place-dot place-dot-target" />Target here
+              </button>
+              <button type="button" role="menuitem" onClick={() => { onAddWaypoint(contextMenu); setContextMenu(null); }}>
+                <span className="place-dot place-dot-waypoint" />Add waypoint here
+              </button>
+              <div className="map-context-readout">
+                {contextMenu.lat.toFixed(5)}, {contextMenu.lng.toFixed(5)}
+                {terrain.hasElevation && <b>{Math.round(terrain.elevationAt(contextMenu))} m</b>}
+              </div>
+            </div>
+          )}
         </MapOverlays>
       </MapContainer>
 

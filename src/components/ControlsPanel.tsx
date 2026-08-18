@@ -1,4 +1,5 @@
 import {
+  ArrowUpDown,
   Bike,
   Compass,
   CornerUpRight,
@@ -28,6 +29,7 @@ type ControlsPanelProps = {
   onSettingsChange: (settings: RouteSettings) => void;
   onPlacementModeChange: (mode: PlacementMode) => void;
   onClearWaypoint: (index: number) => void;
+  onSwapEnds: () => void;
   onReset: () => void;
 };
 
@@ -150,6 +152,7 @@ export function ControlsPanel({
   onSettingsChange,
   onPlacementModeChange,
   onClearWaypoint,
+  onSwapEnds,
   onReset,
 }: ControlsPanelProps) {
   const patch = (next: Partial<RouteSettings>) => onSettingsChange({ ...settings, ...next });
@@ -182,7 +185,15 @@ export function ControlsPanel({
       <div className="panel-section">
         <div className="section-kicker">
           <span>Points</span>
-          <span className="section-aside">{isCalculating ? "Recalculating" : "Live"}</span>
+          <button
+            className="section-action"
+            type="button"
+            onClick={onSwapEnds}
+            disabled={mode === "nearest"}
+            title="Swap the start and the target"
+          >
+            <ArrowUpDown size={11} /> Swap
+          </button>
         </div>
         <div className="points-stack">
           <PointRow
@@ -236,7 +247,10 @@ export function ControlsPanel({
             )}
           </div>
         )}
-        <p className="section-note">Drag any marker on the map to move it. Press Esc to stop placing.</p>
+        <p className="section-note">
+          Drag any marker on the map to move it, or right-click the map to set a point directly.
+          Press Esc to stop placing.
+        </p>
       </div>
 
       <div className="panel-section">
