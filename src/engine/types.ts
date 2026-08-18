@@ -68,9 +68,27 @@ export interface TerrainModel {
   readonly cellSizeMeters: number;
   /** False for the flat fallback, so callers can hide elevation-derived output. */
   readonly hasElevation: boolean;
-  readonly cells: readonly TerrainCell[];
+  /**
+   * Convenience accessor for debugging and presentation.
+   *
+   * Builds a temporary `TerrainCell` object per call, so callers should avoid
+   * using this in hot paths; prefer the index-based accessors below instead.
+   */
   cellAt(row: number, column: number): TerrainCell | undefined;
+  /**
+   * Convenience accessor for coordinates supplied by callers.
+   *
+   * Builds a temporary `TerrainCell` object per call, so callers should avoid
+   * using this in hot paths; prefer the index-based accessors below instead.
+   */
   cellAtCoordinate(coordinate: Coordinate): TerrainCell;
+  /** Flat index of a cell, or `-1` when the row or column is off the grid. */
+  cellIndexAt(row: number, column: number): number;
+  /** Flat index of a coordinate, clamped to the terrain bounds. */
+  cellIndexAtCoordinate(coordinate: Coordinate): number;
+  elevationOfCell(index: number): number;
+  waterRiskOfCell(index: number): number;
+  maxSlopeOfCell(index: number): number;
   contains(coordinate: Coordinate): boolean;
   /** Bilinearly interpolated elevation, smoother than the nearest cell value. */
   elevationAt(coordinate: Coordinate): number;

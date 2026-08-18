@@ -860,7 +860,10 @@ const segmentProfile = (
     const toElevation = terrain.elevationAt(nextSample);
     const elevationChange = toElevation - previousElevation;
     const grade = elevationChange / segmentDistance;
-    const cell = terrainFor(terrain, nextSample);
+    // Read the cell's numbers by index: this runs several times per neighbour
+    // evaluation, and building a TerrainCell here would allocate two objects a
+    // sample for two floats.
+    const cellIndex = terrain.cellIndexAtCoordinate(nextSample);
 
     distanceMeters += segmentDistance;
     elevationChangeMeters += elevationChange;
@@ -868,10 +871,10 @@ const segmentProfile = (
     descentMeters += Math.max(0, -elevationChange);
     maxGrade = Math.max(maxGrade, Math.abs(grade));
     timeMinutes += segmentDistance / speedMetersPerMinute(profile, grade, surface);
-    waterRisk = Math.max(waterRisk, cell.waterRisk);
+    waterRisk = Math.max(waterRisk, terrain.waterRiskOfCell(cellIndex));
     // Use the steepest ground in crossed cells as the safety gate; mean slope
     // can hide short, steep patches that still require protection.
-    sideSlopeDegrees = Math.max(sideSlopeDegrees, cell.maxSlopeDegrees);
+    sideSlopeDegrees = Math.max(sideSlopeDegrees, terrain.maxSlopeOfCell(cellIndex));
 
     previousElevation = toElevation;
     currentSample.lat = nextSample.lat;

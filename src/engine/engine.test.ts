@@ -137,8 +137,13 @@ describe("terrain model", () => {
     const terrain = createFlatTerrainModel(BOUNDS);
     expect(terrain.hasElevation).toBe(false);
     expect(terrain.dataSource).toBe("flat");
-    expect(terrain.cells.every((cell) => cell.elevationMeters === 0)).toBe(true);
-    expect(terrain.cells.every((cell) => cell.slopeDegrees === 0)).toBe(true);
+    for (let row = 0; row < terrain.rows; row += 1) {
+      for (let column = 0; column < terrain.columns; column += 1) {
+        const index = terrain.cellIndexAt(row, column);
+        expect(terrain.elevationOfCell(index)).toBe(0);
+        expect(terrain.maxSlopeOfCell(index)).toBe(0);
+      }
+    }
   });
 
   it("marks water risk only near a mapped watercourse", () => {

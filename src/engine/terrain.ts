@@ -40,16 +40,20 @@ class GridTerrainModel implements TerrainModel {
   readonly columns: number;
   readonly cellSizeMeters: number;
   readonly hasElevation: boolean;
-  readonly cells: readonly TerrainCell[];
 
-  private readonly elevation: ElevationGrid;
+  private readonly sourceElevation: ElevationGrid;
+  private readonly elevationMeters: Float32Array;
+  private readonly slopeMeanDegrees: Float32Array;
+  private readonly maxSlopeDegrees: Float32Array;
+  private readonly ruggednessMeters: Float32Array;
+  private readonly waterRisk: Float32Array;
   private readonly latitudeStep: number;
   private readonly longitudeStep: number;
 
   constructor(options: TerrainModelOptions) {
     this.bounds = options.bounds;
     this.hasElevation = Boolean(options.elevation);
-    this.elevation = options.elevation ?? createFlatElevationGrid(options.bounds);
+    this.sourceElevation = options.elevation ?? createFlatElevationGrid(options.bounds);
     this.dataSource = this.hasElevation ? "elevation-tiles" : "flat";
     this.cellSizeMeters = Math.max(5, options.cellSizeMeters ?? DEFAULT_CELL_SIZE_METERS);
     this.center = {
@@ -67,25 +71,40 @@ class GridTerrainModel implements TerrainModel {
     this.latitudeStep = (this.bounds.north - this.bounds.south) / (this.rows - 1);
     this.longitudeStep = (this.bounds.east - this.bounds.west) / (this.columns - 1);
 
-    const elevations = new Float32Array(this.rows * this.columns);
+    const cellCount = this.rows * this.columns;
+    this.elevationMeters = new Float32Array(cellCount);
     for (let row = 0; row < this.rows; row += 1) {
       for (let column = 0; column < this.columns; column += 1) {
         const { lat, lng } = this.coordinateFor(row, column);
-        elevations[row * this.columns + column] = this.elevation.sample(lat, lng);
+        this.elevationMeters[row * this.columns + column] = this.sourceElevation.sample(lat, lng);
       }
     }
 
-    const waterRisk = this.rasterizeWater(options.waterways ?? []);
-    const { meanSlopeDegrees, maxSlopeDegrees } = this.buildSlopeFields(elevations);
-    this.cells = this.buildCells(elevations, waterRisk, meanSlopeDegrees, maxSlopeDegrees);
+    this.waterRisk = this.rasterizeWater(options.waterways ?? []);
+    const { meanSlopeDegrees, maxSlopeDegrees } = this.buildSlopeFields(this.elevationMeters);
+    this.slopeMeanDegrees = meanSlopeDegrees;
+    this.maxSlopeDegrees = maxSlopeDegrees;
+    this.ruggednessMeters = this.buildRuggedness(this.elevationMeters);
   }
 
   cellAt(row: number, column: number): TerrainCell | undefined {
-    if (row < 0 || row >= this.rows || column < 0 || column >= this.columns) return undefined;
-    return this.cells[row * this.columns + column];
+    const index = this.cellIndexAt(row, column);
+    if (index < 0) return undefined;
+    return this.buildTerrainCell(index, row, column);
   }
 
   cellAtCoordinate(coordinate: Coordinate): TerrainCell {
+    const index = this.cellIndexAtCoordinate(coordinate);
+    const row = Math.floor(index / this.columns);
+    return this.buildTerrainCell(index, row, index - row * this.columns);
+  }
+
+  cellIndexAt(row: number, column: number): number {
+    if (row < 0 || row >= this.rows || column < 0 || column >= this.columns) return -1;
+    return row * this.columns + column;
+  }
+
+  cellIndexAtCoordinate(coordinate: Coordinate): number {
     const row = clamp(
       Math.round((this.bounds.north - coordinate.lat) / this.latitudeStep),
       0,
@@ -96,7 +115,20 @@ class GridTerrainModel implements TerrainModel {
       0,
       this.columns - 1,
     );
-    return this.cells[row * this.columns + column];
+    return this.cellIndexAt(row, column);
+  }
+
+
+  elevationOfCell(index: number): number {
+    return this.elevationMeters[index];
+  }
+
+  waterRiskOfCell(index: number): number {
+    return this.waterRisk[index];
+  }
+
+  maxSlopeOfCell(index: number): number {
+    return this.maxSlopeDegrees[index];
   }
 
   contains(coordinate: Coordinate): boolean {
@@ -105,7 +137,7 @@ class GridTerrainModel implements TerrainModel {
   }
 
   elevationAt(coordinate: Coordinate): number {
-    return this.elevation.sample(coordinate.lat, coordinate.lng);
+    return this.sourceElevation.sample(coordinate.lat, coordinate.lng);
   }
 
   private coordinateFor(row: number, column: number): Coordinate {
@@ -173,13 +205,13 @@ class GridTerrainModel implements TerrainModel {
     maxSlopeDegrees: Float32Array;
   } {
     const cellCount = this.rows * this.columns;
-    const nativeRows = this.elevation.rows;
-    const nativeColumns = this.elevation.columns;
-    const nativeData = this.elevation.data;
-    const nativeNorth = this.elevation.bounds.north;
-    const nativeWest = this.elevation.bounds.west;
-    const nativeLatitudeStep = this.elevation.latitudeStep;
-    const nativeLongitudeStep = this.elevation.longitudeStep;
+    const nativeRows = this.sourceElevation.rows;
+    const nativeColumns = this.sourceElevation.columns;
+    const nativeData = this.sourceElevation.data;
+    const nativeNorth = this.sourceElevation.bounds.north;
+    const nativeWest = this.sourceElevation.bounds.west;
+    const nativeLatitudeStep = this.sourceElevation.latitudeStep;
+    const nativeLongitudeStep = this.sourceElevation.longitudeStep;
     const nativeNorthSouthMeters = nativeLatitudeStep * METERS_PER_DEGREE_LATITUDE;
     const nativeEastWestMeters =
       nativeLongitudeStep * metersPerDegreeLongitude(this.center.lat);
@@ -261,40 +293,41 @@ class GridTerrainModel implements TerrainModel {
     return { meanSlopeDegrees, maxSlopeDegrees };
   }
 
-  private buildCells(
-    elevations: Float32Array,
-    waterRisk: Float32Array,
-    meanSlopeDegrees: Float32Array,
-    maxSlopeDegrees: Float32Array,
-  ): TerrainCell[] {
-    const cells: TerrainCell[] = [];
+  private buildRuggedness(elevations: Float32Array): Float32Array {
+    const cellCount = this.rows * this.columns;
+    const ruggednessMeters = new Float32Array(cellCount);
     const at = (row: number, column: number): number =>
       elevations[clamp(row, 0, this.rows - 1) * this.columns + clamp(column, 0, this.columns - 1)];
-    const indexFor = (row: number, column: number): number => row * this.columns + column;
 
     for (let row = 0; row < this.rows; row += 1) {
       for (let column = 0; column < this.columns; column += 1) {
-        const index = indexFor(row, column);
         const centre = elevations[row * this.columns + column];
         let ruggedness = 0;
         for (const [rowOffset, columnOffset] of NEIGHBOUR_OFFSETS) {
           ruggedness += Math.abs(at(row + rowOffset, column + columnOffset) - centre);
         }
-
-        cells.push({
-          row,
-          column,
-          coordinate: this.coordinateFor(row, column),
-          elevationMeters: centre,
-          slopeDegrees: meanSlopeDegrees[index],
-          maxSlopeDegrees: maxSlopeDegrees[index],
-          ruggednessMeters: ruggedness / NEIGHBOUR_OFFSETS.length,
-          waterRisk: waterRisk[index],
-        });
+        ruggednessMeters[row * this.columns + column] = ruggedness / NEIGHBOUR_OFFSETS.length;
       }
     }
 
-    return cells;
+    return ruggednessMeters;
+  }
+
+  private buildTerrainCell(
+    index: number,
+    row: number,
+    column: number,
+  ): TerrainCell {
+    return {
+      row,
+      column,
+      coordinate: this.coordinateFor(row, column),
+      elevationMeters: this.elevationMeters[index],
+      slopeDegrees: this.slopeMeanDegrees[index],
+      maxSlopeDegrees: this.maxSlopeDegrees[index],
+      ruggednessMeters: this.ruggednessMeters[index],
+      waterRisk: this.waterRisk[index],
+    };
   }
 }
 
