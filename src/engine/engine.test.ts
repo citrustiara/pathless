@@ -1,121 +1,272 @@
 import { describe, expect, it } from "vitest";
 import {
-  createSyntheticTerrainModel,
-  localMetersToCoordinate,
-  normalizeRoutingPreferences,
-  planRoute,
+  buildContours,
+  createElevationGrid,
+  createFlatTerrainModel,
+  createTerrainModel,
+  distanceBetweenCoordinates,
+  osmGraphStats,
+  planOSMRoute,
+  suggestContourInterval,
   type Coordinate,
+  type GeoBounds,
+  type OSMRoutingRequest,
 } from "./index";
 
-const point = (xMeters: number, yMeters: number): Coordinate =>
-  localMetersToCoordinate({ x: xMeters, y: yMeters });
+const BOUNDS: GeoBounds = { north: 54.47, south: 54.445, east: 18.535, west: 18.48 };
 
-describe("synthetic terrain model", () => {
-  it("is deterministic and centred on the prototype location", () => {
-    const first = createSyntheticTerrainModel();
-    const second = createSyntheticTerrainModel();
-    const centre = first.cellAtCoordinate({ lat: 54.458403, lng: 18.509192 });
+/** A clean north-facing ramp: 0 m on the northern edge, 100 m on the southern. */
+const rampGrid = (rows = 21, columns = 21) => {
+  const data = new Float32Array(rows * columns);
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      data[row * columns + column] = (row / (rows - 1)) * 100;
+    }
+  }
+  return createElevationGrid(BOUNDS, rows, columns, data);
+};
 
-    expect(first.center).toEqual({ lat: 54.458403, lng: 18.509192 });
-    expect(first.cells).toEqual(second.cells);
-    expect(centre.coordinate.lat).toBeCloseTo(54.458403, 5);
-    expect(centre.coordinate.lng).toBeCloseTo(18.509192, 5);
-    expect(first.cells.some((cell) => cell.mappedPath)).toBe(true);
-    expect(first.cells.some((cell) => cell.landCover === "water")).toBe(true);
+const baseRequest: OSMRoutingRequest = {
+  mode: "destination",
+  origin: { lat: 54.4580849, lng: 18.5120994 },
+  destination: { lat: 54.4605396, lng: 18.5086773 },
+  waypoints: [],
+  profile: "hiker",
+  maxGradePercent: 45,
+  offTrailAversion: 2,
+  maxOffTrailMeters: 400,
+  allowStreetCrossing: true,
+  allowStreetWalking: false,
+  avoidWater: false,
+  alternatives: 1,
+};
+
+const terrainFor = (grid = rampGrid()) =>
+  createTerrainModel({ bounds: BOUNDS, elevation: grid, cellSizeMeters: 25 });
+
+describe("elevation grid", () => {
+  it("interpolates between samples instead of snapping to the nearest one", () => {
+    const grid = rampGrid();
+    expect(grid.sample(BOUNDS.north, BOUNDS.west)).toBeCloseTo(0, 4);
+    expect(grid.sample(BOUNDS.south, BOUNDS.east)).toBeCloseTo(100, 4);
+    expect(grid.sample((BOUNDS.north + BOUNDS.south) / 2, BOUNDS.west)).toBeCloseTo(50, 2);
+  });
+
+  it("clamps samples taken outside the grid", () => {
+    const grid = rampGrid();
+    expect(grid.sample(BOUNDS.north + 1, BOUNDS.west - 1)).toBeCloseTo(0, 4);
+    expect(grid.sample(BOUNDS.south - 1, BOUNDS.east + 1)).toBeCloseTo(100, 4);
   });
 });
 
-describe("terrain router", () => {
-  it("routes to a selected destination with objective-diverse alternatives", () => {
-    const result = planRoute({
-      mode: "selected-destination",
-      origin: point(-1_100, -700),
-      destination: point(1_100, 650),
-      profile: "walking",
-      alternatives: 3,
-    });
+describe("contours", () => {
+  it("draws one line per interval across a ramp, at the right heights", () => {
+    const grid = rampGrid();
+    const contours = buildContours(grid, 10);
+    const elevations = [...new Set(contours.map((line) => line.elevation))].sort((a, b) => a - b);
 
-    expect(result.errors).toEqual([]);
-    expect(result.routes.length).toBe(3);
-    expect(result.primaryRoute?.metrics.distanceMeters).toBeGreaterThan(0);
-    expect(result.primaryRoute?.metrics.ascentMeters).toBeGreaterThanOrEqual(0);
-    expect(result.primaryRoute?.metrics.maxSlopeDegrees).toBeGreaterThan(0);
-    expect(result.primaryRoute?.metrics.estimatedTimeMinutes).toBeGreaterThan(0);
-    expect(result.primaryRoute?.metrics.confidence).toBeGreaterThanOrEqual(0);
-    expect(result.primaryRoute?.metrics.confidence).toBeLessThanOrEqual(1);
-    expect(result.routes.map((route) => route.objective)).toEqual([
-      "balanced",
-      "fastest",
-      "gentle",
-    ]);
-
-    const routeSignatures = result.routes.map((route) =>
-      route.coordinates.map((coordinate) => `${coordinate.lat},${coordinate.lng}`).join(";"),
-    );
-    expect(new Set(routeSignatures).size).toBeGreaterThan(1);
+    // Every level is a clean multiple of the interval, and the levels between
+    // the extremes are all present.
+    expect(elevations.every((value) => value % 10 === 0)).toBe(true);
+    expect(elevations).toEqual(expect.arrayContaining([10, 20, 30, 40, 50, 60, 70, 80, 90]));
+    // A north-facing ramp has exactly one contour per level, running east-west.
+    expect(contours.filter((line) => line.elevation === 50)).toHaveLength(1);
+    const fifty = contours.find((line) => line.elevation === 50);
+    const latitudes = fifty?.points.map(([lat]) => lat) ?? [];
+    expect(Math.max(...latitudes) - Math.min(...latitudes)).toBeLessThan(1e-6);
   });
 
-  it("finds the nearest mapped path without a destination", () => {
-    const result = planRoute({
-      mode: "nearest-mapped-path",
-      origin: point(0, 0),
-      profile: "mtb",
-      alternatives: 2,
-    });
-
-    expect(result.errors).toEqual([]);
-    expect(result.snappedTargets).toHaveLength(1);
-    expect(result.primaryRoute).toBeDefined();
-    expect(result.primaryRoute?.coordinates.length).toBeGreaterThan(0);
-    expect(
-      createSyntheticTerrainModel()
-        .cellAtCoordinate(result.snappedTargets[0])
-        .mappedPath,
-    ).toBe(true);
+  it("marks every fifth interval as an index contour", () => {
+    const indexElevations = buildContours(rampGrid(), 10)
+      .filter((line) => line.index)
+      .map((line) => line.elevation);
+    expect(indexElevations.every((value) => value % 50 === 0)).toBe(true);
+    expect(indexElevations).toContain(50);
+    expect(indexElevations).not.toContain(40);
   });
 
-  it("joins design-route legs in waypoint order", () => {
-    const waypoints = [point(-700, -450), point(650, 500)];
-    const result = planRoute({
-      mode: "design-route",
-      origin: point(-1_150, -800),
-      waypoints,
-      profile: "walking",
-      preferences: { pathPreference: 0.8, waterAvoidance: 1 },
-      alternatives: 1,
-    });
-
-    expect(result.errors).toEqual([]);
-    expect(result.primaryRoute?.snappedWaypoints).toHaveLength(2);
-    expect(result.primaryRoute?.coordinates).toContainEqual(
-      result.primaryRoute?.snappedWaypoints[0],
-    );
-    expect(result.primaryRoute?.coordinates).toContainEqual(
-      result.primaryRoute?.snappedWaypoints[1],
-    );
-    expect(result.primaryRoute?.metrics.distanceMeters).toBeGreaterThan(
-      1_000,
-    );
+  it("scales the interval to the local relief", () => {
+    const gentle = createElevationGrid(BOUNDS, 4, 4, new Float32Array([
+      0, 1, 2, 3, 1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6,
+    ]));
+    expect(suggestContourInterval(gentle)).toBeLessThanOrEqual(2);
+    expect(suggestContourInterval(rampGrid())).toBeGreaterThanOrEqual(5);
   });
 
-  it("normalizes slider input to safe preference ranges", () => {
-    expect(
-      normalizeRoutingPreferences({
-        slopeTolerance: 999,
-        ascentPreference: -999,
-        ascentBudget: -20,
-        roughness: Number.NaN,
-        pathPreference: 2,
-        waterAvoidance: -1,
-      }),
-    ).toEqual({
-      slopeTolerance: 45,
-      ascentPreference: -1,
-      ascentBudget: 0,
-      roughness: 0.45,
-      pathPreference: 1,
-      waterAvoidance: 0,
-    });
+  it("returns nothing for a nonsense interval", () => {
+    expect(buildContours(rampGrid(), 0)).toEqual([]);
+    expect(buildContours(rampGrid(), Number.NaN)).toEqual([]);
   });
 });
 
+describe("terrain model", () => {
+  it("derives slope from the real elevation gradient", () => {
+    const terrain = terrainFor();
+    const heightMeters = (BOUNDS.north - BOUNDS.south) * 111_132;
+    const expectedDegrees = (Math.atan(100 / heightMeters) * 180) / Math.PI;
+    const middle = terrain.cellAtCoordinate({
+      lat: (BOUNDS.north + BOUNDS.south) / 2,
+      lng: (BOUNDS.east + BOUNDS.west) / 2,
+    });
+
+    expect(terrain.hasElevation).toBe(true);
+    expect(middle.slopeDegrees).toBeCloseTo(expectedDegrees, 1);
+    // A perfectly smooth ramp is not rugged, even though it is steep.
+    expect(middle.ruggednessMeters).toBeLessThan(1.5);
+  });
+
+  it("reports flat ground rather than inventing relief when tiles are missing", () => {
+    const terrain = createFlatTerrainModel(BOUNDS);
+    expect(terrain.hasElevation).toBe(false);
+    expect(terrain.dataSource).toBe("flat");
+    expect(terrain.cells.every((cell) => cell.elevationMeters === 0)).toBe(true);
+    expect(terrain.cells.every((cell) => cell.slopeDegrees === 0)).toBe(true);
+  });
+
+  it("marks water risk only near a mapped watercourse", () => {
+    const stream: Coordinate[] = [
+      { lat: 54.4575, lng: 18.5 },
+      { lat: 54.4575, lng: 18.515 },
+    ];
+    const terrain = createTerrainModel({
+      bounds: BOUNDS,
+      elevation: rampGrid(),
+      cellSizeMeters: 25,
+      waterways: [stream],
+    });
+
+    expect(terrain.cellAtCoordinate({ lat: 54.4575, lng: 18.507 }).waterRisk).toBeGreaterThan(0.3);
+    expect(terrain.cellAtCoordinate({ lat: 54.4655, lng: 18.507 }).waterRisk).toBe(0);
+  });
+});
+
+describe("OSM router", () => {
+  it("imports mapped crossing evidence from the snapshot", () => {
+    expect(osmGraphStats.nodes).toBeGreaterThan(0);
+    expect(osmGraphStats.mappedCrossings).toBeGreaterThan(0);
+  });
+
+  it("keeps off the carriageway unless street walking is allowed", () => {
+    const terrain = terrainFor();
+    const onFoot = planOSMRoute(baseRequest, terrain);
+    expect(onFoot.errors).toEqual([]);
+    expect(onFoot.routes[0]?.segments.some((segment) => segment.highway === "secondary")).toBe(false);
+
+    const onStreets = planOSMRoute({ ...baseRequest, allowStreetWalking: true }, terrain);
+    expect(onStreets.routes[0]?.segments.some((segment) => segment.highway === "secondary")).toBe(true);
+  });
+
+  it("refuses a route rather than exceeding the grade limit", () => {
+    const result = planOSMRoute({ ...baseRequest, maxGradePercent: 2 }, terrainFor());
+    expect(result.routes).toEqual([]);
+    expect(result.errors[0]).toContain("No route satisfies");
+  });
+
+  it("never exceeds the grade limit on a route it does return", () => {
+    const result = planOSMRoute({ ...baseRequest, maxGradePercent: 25 }, terrainFor());
+    expect(result.routes.length).toBeGreaterThan(0);
+    expect(result.routes[0].maxGrade).toBeLessThanOrEqual(0.255);
+  });
+
+  it("honours the cap on any single off-trail stretch", () => {
+    const terrain = terrainFor();
+    const result = planOSMRoute({ ...baseRequest, maxOffTrailMeters: 60 }, terrain);
+    for (const route of result.routes) {
+      expect(route.longestOffTrailMeters).toBeLessThanOrEqual(61);
+    }
+  });
+
+  it("treats crossing a street as an option the caller controls", () => {
+    const terrain = terrainFor();
+    const strict = planOSMRoute({ ...baseRequest, allowStreetCrossing: false }, terrain);
+    const relaxed = planOSMRoute({ ...baseRequest, allowStreetCrossing: true }, terrain);
+
+    expect(relaxed.routes.length).toBeGreaterThan(0);
+    // Allowing crossings can only ever open up more of the network.
+    if (strict.routes.length > 0) {
+      expect(relaxed.routes[0].estimatedTimeMinutes)
+        .toBeLessThanOrEqual(strict.routes[0].estimatedTimeMinutes + 0.001);
+    }
+  });
+
+  it("returns alternatives that actually differ from each other", () => {
+    const result = planOSMRoute(
+      {
+        ...baseRequest,
+        origin: { lat: 54.447, lng: 18.49 },
+        destination: { lat: 54.468, lng: 18.53 },
+        alternatives: 3,
+      },
+      terrainFor(),
+    );
+
+    expect(result.routes.length).toBeGreaterThan(1);
+    expect(new Set(result.routes.map((route) => route.objective)).size)
+      .toBe(result.routes.length);
+    const geometries = result.routes.map((route) =>
+      route.coordinates.map((point) => `${point.lat},${point.lng}`).join(";"));
+    expect(new Set(geometries).size).toBe(result.routes.length);
+  });
+
+  it("reports climb, time, and an elevation profile that agree with each other", () => {
+    const route = planOSMRoute(baseRequest, terrainFor()).routes[0];
+    expect(route).toBeDefined();
+    expect(route.distanceMeters).toBeGreaterThan(0);
+    expect(route.estimatedTimeMinutes).toBeGreaterThan(0);
+    expect(route.samples.length).toBe(route.segments.length + 1);
+    expect(route.samples[0].distanceMeters).toBe(0);
+    expect(route.samples[route.samples.length - 1].distanceMeters)
+      .toBeCloseTo(route.distanceMeters, 6);
+    expect(route.ascentMeters - route.descentMeters).toBeCloseTo(
+      route.samples[route.samples.length - 1].elevationMeters - route.samples[0].elevationMeters,
+      0,
+    );
+    const surfaceTotal = route.surfaceBreakdown
+      .reduce((total, entry) => total + entry.distanceMeters, 0);
+    expect(surfaceTotal).toBeCloseTo(route.distanceMeters, 6);
+  });
+
+  it("says so instead of guessing when elevation is unavailable", () => {
+    const result = planOSMRoute(baseRequest, createFlatTerrainModel(BOUNDS));
+    expect(result.routes[0]?.ascentMeters).toBe(0);
+    expect(result.warnings.join(" ")).toContain("Elevation data is unavailable");
+  });
+
+  it("costs more time uphill than downhill along the same ground", () => {
+    // The ramp rises towards the south, so swapping the endpoints swaps the
+    // direction of travel without changing the terrain underneath.
+    const terrain = terrainFor();
+    const northbound = planOSMRoute(baseRequest, terrain).routes[0];
+    const southbound = planOSMRoute(
+      { ...baseRequest, origin: baseRequest.destination as Coordinate, destination: baseRequest.origin },
+      terrain,
+    ).routes[0];
+
+    expect(northbound.ascentMeters).toBeLessThan(northbound.descentMeters);
+    expect(southbound.ascentMeters).toBeGreaterThan(southbound.descentMeters);
+    expect(southbound.estimatedTimeMinutes / southbound.distanceMeters)
+      .toBeGreaterThan(northbound.estimatedTimeMinutes / northbound.distanceMeters);
+  });
+
+  it("finds the nearest mapped path when no destination is given", () => {
+    const result = planOSMRoute({ ...baseRequest, mode: "nearest", destination: undefined }, terrainFor());
+    expect(result.errors).toEqual([]);
+    const route = result.routes[0];
+    expect(route.snappedDestination).toBeDefined();
+    expect(distanceBetweenCoordinates(baseRequest.origin, route.snappedDestination as Coordinate))
+      .toBeLessThan(600);
+  });
+
+  it("visits design-mode waypoints in order", () => {
+    const waypoint = { lat: 54.4596, lng: 18.5142 };
+    const result = planOSMRoute(
+      { ...baseRequest, mode: "design", waypoints: [waypoint] },
+      terrainFor(),
+    );
+    expect(result.errors).toEqual([]);
+    const nearest = Math.min(
+      ...result.routes[0].coordinates.map((point) => distanceBetweenCoordinates(point, waypoint)),
+    );
+    expect(nearest).toBeLessThan(30);
+  });
+});

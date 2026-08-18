@@ -1,234 +1,516 @@
+import L from "leaflet";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
-  LocateFixed,
-  Minus,
-  Plus,
-  RotateCcw,
-  Sparkles,
-  Waves,
-  X,
-} from "lucide-react";
-import type { MapPoint, PlacementMode, RouteResult } from "./pathless-types";
+  MapContainer,
+  Marker,
+  Polyline,
+  Rectangle,
+  TileLayer,
+  Tooltip,
+  useMap,
+  useMapEvents,
+} from "react-leaflet";
+import type { LatLngBoundsExpression } from "leaflet";
+import { Crosshair, Layers, Minus, Plus, Maximize2, Route as RouteIcon } from "lucide-react";
+import { SOPOCKA_BOUNDS, SOPOCKA_OSM_FEATURES, type OSMFeature } from "../data/sopocka";
+import type { Coordinate, ElevationGrid, OSMRoute, TerrainModel } from "../engine";
+import { suggestContourInterval } from "../engine";
+import { ContourLayer, ElevationTintLayer } from "./TerrainLayers";
+import type { AppMode, ElevationStatus, MapPoint, PlacementMode, RouteView } from "./pathless-types";
+
+export type MapLayers = {
+  tint: boolean;
+  contours: boolean;
+  paths: boolean;
+};
 
 type MapCanvasProps = {
-  route: RouteResult;
+  view: RouteView;
+  mode: AppMode;
   start: MapPoint;
   target: MapPoint;
   waypoints: MapPoint[];
   placementMode: PlacementMode;
+  isCalculating: boolean;
+  elevationStatus: ElevationStatus;
+  elevationGrid?: ElevationGrid;
+  terrain: TerrainModel;
+  layers: MapLayers;
+  detailsHidden: boolean;
+  hoverPoint?: Coordinate | null;
+  onLayersChange: (layers: MapLayers) => void;
   onMapClick: (point: MapPoint) => void;
-  onPlacementModeChange: (mode: Exclude<PlacementMode, null>) => void;
-  onClearWaypoint: (index: number) => void;
+  onPlacementModeChange: (mode: PlacementMode) => void;
+  onMovePoint: (kind: "start" | "target" | "waypoint", index: number, point: MapPoint) => void;
+  onSelectAlternative: (index: number) => void;
+  children?: ReactNode;
 };
 
-const terrainLabels = [
-  { label: "Pine shelf", x: 19, y: 24, tone: "green" },
-  { label: "Birch hollow", x: 62, y: 18, tone: "slate" },
-  { label: "Unmapped land", x: 68, y: 72, tone: "orange" },
-  { label: "North ridge", x: 29, y: 78, tone: "blue" },
-] as const;
+const DATA_BOUNDS: LatLngBoundsExpression = [
+  [SOPOCKA_BOUNDS.south, SOPOCKA_BOUNDS.west],
+  [SOPOCKA_BOUNDS.north, SOPOCKA_BOUNDS.east],
+];
 
-function pathD(points: MapPoint[]): string {
-  return points
-    .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`)
-    .join(" ");
+const PAN_BOUNDS: LatLngBoundsExpression = [
+  [SOPOCKA_BOUNDS.south - 0.02, SOPOCKA_BOUNDS.west - 0.03],
+  [SOPOCKA_BOUNDS.north + 0.02, SOPOCKA_BOUNDS.east + 0.03],
+];
+
+const visibleOsmFeatures = SOPOCKA_OSM_FEATURES.filter((feature) =>
+  feature.category === "path" || feature.category === "water" || feature.highway === "track");
+
+const featureStyle = (feature: OSMFeature) => {
+  if (feature.category === "water") return { color: "#5d94b0", weight: 2.2, opacity: 0.55 };
+  if (feature.highway === "track") {
+    return { color: "#96703f", weight: 2.1, opacity: 0.7, dashArray: "6 4" };
+  }
+  if (feature.highway === "steps") return { color: "#a8623f", weight: 2, opacity: 0.6, dashArray: "2 3" };
+  return { color: "#a35f4a", weight: 1.7, opacity: 0.6, dashArray: "3 4" };
+};
+
+const pointIcon = (kind: string, label: string) =>
+  L.divIcon({
+    className: "map-pin-wrapper",
+    html: `<span class="map-pin map-pin-${kind}">${label}</span>`,
+    iconSize: [22, 22],
+    iconAnchor: [11, 11],
+  });
+
+const routeLatLngs = (route: OSMRoute): Array<[number, number]> =>
+  route.coordinates.map(({ lat, lng }) => [lat, lng]);
+
+/** Split the route so mapped ways and open ground can be drawn differently. */
+const routeStrands = (route: OSMRoute): Array<{ mapped: boolean; points: Array<[number, number]> }> => {
+  const strands: Array<{ mapped: boolean; points: Array<[number, number]> }> = [];
+  for (const segment of route.segments) {
+    const last = strands[strands.length - 1];
+    if (last && last.mapped === segment.mappedPath) {
+      last.points.push([segment.to.lat, segment.to.lng]);
+    } else {
+      strands.push({
+        mapped: segment.mappedPath,
+        points: [[segment.from.lat, segment.from.lng], [segment.to.lat, segment.to.lng]],
+      });
+    }
+  }
+  return strands;
+};
+
+function MapReady() {
+  const map = useMap();
+  useEffect(() => {
+    map.fitBounds(DATA_BOUNDS, { padding: [24, 24] });
+    const frame = window.requestAnimationFrame(() => map.invalidateSize());
+    return () => window.cancelAnimationFrame(frame);
+  }, [map]);
+  return null;
 }
 
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.min(maximum, Math.max(minimum, value));
+/**
+ * The HUD lives inside the Leaflet container so it can use the map context.
+ * Without this, a click on a button would also pan or zoom the map underneath.
+ */
+function MapOverlays({ children }: { children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!ref.current) return;
+    L.DomEvent.disableClickPropagation(ref.current);
+    L.DomEvent.disableScrollPropagation(ref.current);
+  }, []);
+  return <div className="map-overlays" ref={ref}>{children}</div>;
+}
+
+function FitRoute({ route, detailsHidden }: { route?: OSMRoute; detailsHidden: boolean }) {
+  const map = useMap();
+  const signature = route ? `${route.id}:${route.coordinates.length}:${Math.round(route.distanceMeters)}` : "";
+
+  useEffect(() => {
+    if (!route || route.coordinates.length < 2) return;
+    const frame = window.requestAnimationFrame(() => {
+      map.invalidateSize();
+      map.fitBounds(routeLatLngs(route), {
+        paddingTopLeft: [70, 70],
+        paddingBottomRight: detailsHidden ? [70, 70] : [400, 90],
+        maxZoom: 17,
+        animate: false,
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [signature, detailsHidden, map, route]);
+
+  return null;
+}
+
+function MapInteractions({
+  placementMode,
+  onMapClick,
+  onCursorChange,
+}: {
+  placementMode: PlacementMode;
+  onMapClick: (point: MapPoint) => void;
+  onCursorChange: (point: Coordinate | null) => void;
+}) {
+  useMapEvents({
+    click: (event) => {
+      if (placementMode) onMapClick({ lat: event.latlng.lat, lng: event.latlng.lng });
+    },
+    mousemove: (event) => onCursorChange({ lat: event.latlng.lat, lng: event.latlng.lng }),
+    mouseout: () => onCursorChange(null),
+  });
+  return null;
+}
+
+function ScaleReadout() {
+  const map = useMap();
+  const [scale, setScale] = useState<{ label: string; width: number } | null>(null);
+
+  const update = useCallback(() => {
+    const bounds = map.getBounds();
+    const centreLatitude = bounds.getCenter().lat;
+    const metersPerPixel = map.distance(
+      L.latLng(centreLatitude, bounds.getWest()),
+      L.latLng(centreLatitude, bounds.getEast()),
+    ) / map.getSize().x;
+    const target = metersPerPixel * 90;
+    const magnitude = 10 ** Math.floor(Math.log10(target));
+    const rounded = [1, 2, 5, 10].map((step) => step * magnitude)
+      .reduce((best, value) => (Math.abs(value - target) < Math.abs(best - target) ? value : best));
+    setScale({
+      label: rounded >= 1_000 ? `${rounded / 1_000} km` : `${rounded} m`,
+      width: rounded / metersPerPixel,
+    });
+  }, [map]);
+
+  useMapEvents({ zoomend: update, moveend: update, resize: update });
+  useEffect(update, [update]);
+
+  if (!scale) return null;
+  return (
+    <div className="map-scale-bar" aria-label={`Map scale, ${scale.label}`}>
+      <span className="map-scale-line" style={{ width: `${Math.round(scale.width)}px` }} />
+      <span>{scale.label}</span>
+    </div>
+  );
+}
+
+function ZoomControls() {
+  const map = useMap();
+  return (
+    <div className="map-control-stack">
+      <button type="button" aria-label="Zoom in" title="Zoom in" onClick={() => map.zoomIn()}>
+        <Plus size={15} />
+      </button>
+      <span className="map-control-divider" />
+      <button type="button" aria-label="Zoom out" title="Zoom out" onClick={() => map.zoomOut()}>
+        <Minus size={15} />
+      </button>
+      <span className="map-control-divider" />
+      <button
+        type="button"
+        aria-label="Fit the mapped area"
+        title="Fit the mapped area"
+        onClick={() => map.fitBounds(DATA_BOUNDS, { padding: [24, 24] })}
+      >
+        <Maximize2 size={14} />
+      </button>
+    </div>
+  );
 }
 
 export function MapCanvas({
-  route,
+  view,
+  mode,
   start,
   target,
   waypoints,
   placementMode,
+  isCalculating,
+  elevationStatus,
+  elevationGrid,
+  terrain,
+  layers,
+  detailsHidden,
+  hoverPoint,
+  onLayersChange,
   onMapClick,
   onPlacementModeChange,
-  onClearWaypoint,
+  onMovePoint,
+  onSelectAlternative,
+  children,
 }: MapCanvasProps) {
-  function handleSurfaceClick(event: React.MouseEvent<HTMLDivElement>) {
-    if (!placementMode) return;
+  const [cursor, setCursor] = useState<Coordinate | null>(null);
+  const [layersOpen, setLayersOpen] = useState(false);
+  const layersRef = useRef<HTMLDivElement>(null);
 
-    const bounds = event.currentTarget.getBoundingClientRect();
-    onMapClick({
-      x: clamp(((event.clientX - bounds.left) / bounds.width) * 100, 4, 96),
-      y: clamp(((event.clientY - bounds.top) / bounds.height) * 100, 6, 94),
-    });
-  }
+  const contourInterval = useMemo(
+    () => (elevationGrid && elevationGrid.rows > 2 ? suggestContourInterval(elevationGrid) : 0),
+    [elevationGrid],
+  );
+
+  useEffect(() => {
+    if (!layersOpen) return;
+    const close = (event: MouseEvent) => {
+      if (!layersRef.current?.contains(event.target as Node)) setLayersOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [layersOpen]);
+
+  const primary = view.route;
+  const cursorElevation = cursor && terrain.hasElevation ? terrain.elevationAt(cursor) : null;
+
+  const placementLabel = placementMode === "waypoint"
+    ? "a waypoint"
+    : placementMode === "target"
+      ? "the target"
+      : "the start";
+
+  const togglePlacement = (next: Exclude<PlacementMode, null>) =>
+    onPlacementModeChange(placementMode === next ? null : next);
 
   return (
-    <section className="map-workspace" aria-label="Route map workspace">
-      <div className="map-header">
-        <div>
-          <div className="eyebrow">Route workspace</div>
-          <h1>North ridge traverse</h1>
-        </div>
-        <div className="map-header-actions">
-          <span className="map-status">
-            <span className="status-dot status-dot-green" />
-            Live terrain model
-          </span>
-          <button className="icon-button map-header-icon" type="button" aria-label="Reset map view" title="Reset map view">
-            <RotateCcw size={15} strokeWidth={1.8} />
-          </button>
-        </div>
-      </div>
-
-      <div
-        className={`map-surface ${placementMode ? "map-surface-placement" : ""}`}
-        onClick={handleSurfaceClick}
-        role="application"
-        aria-label="Interactive terrain map. Choose a placement tool, then click anywhere on the map."
+    <div className={`map-surface ${placementMode ? "map-surface-placement" : ""}`}>
+      <MapContainer
+        className="leaflet-map"
+        bounds={DATA_BOUNDS}
+        maxBounds={PAN_BOUNDS}
+        maxBoundsViscosity={0.7}
+        minZoom={12}
+        maxZoom={19}
+        zoomControl={false}
+        attributionControl={false}
+        preferCanvas
+        scrollWheelZoom
       >
-        <div className="map-grid map-grid-horizontal" />
-        <div className="map-grid map-grid-vertical" />
+        <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" maxZoom={19} />
 
-        <svg className="terrain-svg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
-          <defs>
-            <linearGradient id="map-wash" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0" stopColor="#f8faf7" />
-              <stop offset="0.55" stopColor="#f4f6f3" />
-              <stop offset="1" stopColor="#eef2ef" />
-            </linearGradient>
-            <linearGradient id="ridge-wash" x1="0" y1="0" x2="0.8" y2="1">
-              <stop offset="0" stopColor="#dfe9df" stopOpacity="0.75" />
-              <stop offset="1" stopColor="#f4f6f3" stopOpacity="0" />
-            </linearGradient>
-            <filter id="route-shadow" x="-10%" y="-10%" width="120%" height="120%">
-              <feDropShadow dx="0" dy="0.6" stdDeviation="0.7" floodColor="#214b87" floodOpacity="0.22" />
-            </filter>
-          </defs>
+        {elevationGrid && (
+          <>
+            <ElevationTintLayer grid={elevationGrid} visible={layers.tint} />
+            <ContourLayer grid={elevationGrid} visible={layers.contours} interval={contourInterval} />
+          </>
+        )}
 
-          <rect width="100" height="100" fill="url(#map-wash)" />
-          <path d="M -5 72 C 13 61, 17 77, 30 65 S 54 49, 67 64 S 88 71, 106 57 L 106 106 L -5 106 Z" fill="url(#ridge-wash)" />
-          <path d="M -4 38 C 9 29, 17 42, 30 31 S 52 13, 66 30 S 87 38, 106 21" fill="none" stroke="#d8e2d7" strokeWidth="1.2" opacity="0.9" />
-          <path d="M -4 42 C 10 33, 18 46, 30 35 S 52 17, 66 34 S 87 42, 106 25" fill="none" stroke="#e2e9e1" strokeWidth="0.7" />
-          <path d="M -3 55 C 12 45, 19 59, 31 49 S 50 31, 64 46 S 89 56, 104 41" fill="none" stroke="#d4ded4" strokeWidth="0.95" />
-          <path d="M -3 59 C 12 49, 20 63, 32 53 S 51 35, 65 50 S 90 60, 104 45" fill="none" stroke="#e0e7df" strokeWidth="0.65" />
-          <path d="M -1 75 C 10 66, 21 77, 33 70 S 53 51, 68 67 S 89 76, 102 64" fill="none" stroke="#cbd9cc" strokeWidth="0.9" />
-          <path d="M 7 8 C 14 16, 19 21, 23 32 S 31 47, 42 52 S 54 69, 64 91" fill="none" stroke="#bdccd3" strokeWidth="1.15" opacity="0.78" />
-          <path d="M 9 5 C 16 14, 21 20, 25 31 S 33 44, 44 50 S 56 68, 67 95" fill="none" stroke="#e9eeef" strokeWidth="0.75" />
-          <path d="M 84 -4 C 78 10, 79 19, 86 27 S 93 45, 81 55 S 75 74, 84 104" fill="none" stroke="#c3d2c7" strokeWidth="1.05" opacity="0.8" />
-          <path d="M 89 -4 C 83 10, 84 18, 91 26 S 98 44, 86 54 S 80 73, 89 104" fill="none" stroke="#e3eae5" strokeWidth="0.75" />
+        <MapReady />
+        <FitRoute route={primary} detailsHidden={detailsHidden} />
+        <MapInteractions
+          placementMode={placementMode}
+          onMapClick={onMapClick}
+          onCursorChange={setCursor}
+        />
 
-          <path d="M -5 86 C 10 80, 13 91, 25 84 S 45 72, 58 82 S 76 92, 105 82" fill="none" stroke="#c8d6c9" strokeWidth="0.85" />
-          <path d="M -2 91 C 13 85, 16 96, 28 89 S 46 77, 60 87 S 77 97, 104 87" fill="none" stroke="#dce5dc" strokeWidth="0.65" />
-          <path d="M 39 -2 C 44 12, 39 24, 47 35 S 54 48, 49 61 S 51 82, 57 102" fill="none" stroke="#dae3dd" strokeWidth="0.75" />
+        <Rectangle bounds={DATA_BOUNDS} pathOptions={{ color: "#6f8794", weight: 1, opacity: 0.4, fill: false, dashArray: "4 5" }} interactive={false} />
 
-          <path d="M 22 9 C 30 4, 35 8, 39 15 C 42 21, 38 27, 31 29 C 24 30, 18 23, 18 17 C 18 13, 19 11, 22 9 Z" fill="#e6efe5" opacity="0.9" />
-          <path d="M 68 60 C 73 54, 83 55, 88 61 C 93 68, 88 77, 80 78 C 72 78, 65 71, 68 60 Z" fill="#f5ecd9" opacity="0.48" />
-          <path d="M 12 51 C 18 46, 26 49, 27 57 C 27 65, 20 70, 14 66 C 8 63, 7 56, 12 51 Z" fill="#ecf2e9" opacity="0.8" />
-
-          <path d={pathD(route.alternatives[0] ?? [])} fill="none" stroke="#9ca9b2" strokeWidth="1.6" strokeDasharray="2.2 2.2" opacity="0.62" />
-          <path d={pathD(route.alternatives[1] ?? [])} fill="none" stroke="#b7a987" strokeWidth="1.35" strokeDasharray="1.6 2.4" opacity="0.68" />
-          <path d={pathD(route.routePath)} fill="none" stroke="#ffffff" strokeWidth="3.8" strokeLinecap="round" strokeLinejoin="round" opacity="0.9" filter="url(#route-shadow)" />
-          <path d={pathD(route.routePath)} fill="none" stroke="#2f6fc4" strokeWidth="2.15" strokeLinecap="round" strokeLinejoin="round" />
-          <path d={pathD(route.routePath)} fill="none" stroke="#79a9e5" strokeWidth="0.65" strokeLinecap="round" strokeLinejoin="round" opacity="0.9" />
-        </svg>
-
-        <div className="map-label map-label-pine"><span className="map-label-dot map-label-dot-green" />Pine shelf</div>
-        <div className="map-label map-label-ridge"><span className="map-label-dot map-label-dot-blue" />North ridge</div>
-        <div className="map-label map-label-hollow"><span className="map-label-dot map-label-dot-slate" />Birch hollow</div>
-        <div className="map-label map-label-unmapped"><span className="map-label-dot map-label-dot-orange" />Unmapped land</div>
-        <div className="water-label"><Waves size={12} />Seasonal creek</div>
-
-        <div className="map-marker map-marker-start" style={{ left: `${start.x}%`, top: `${start.y}%` }} title="Start point">
-          <span className="marker-pulse" />
-          <span className="marker-core marker-core-start" />
-          <span className="marker-caption">Start</span>
-        </div>
-        {waypoints.map((waypoint, index) => (
-          <div
-            className="map-marker map-marker-waypoint"
-            key={`${waypoint.x}-${waypoint.y}-${index}`}
-            style={{ left: `${waypoint.x}%`, top: `${waypoint.y}%` }}
-            title={`Waypoint ${index + 1}`}
+        {layers.paths && visibleOsmFeatures.map((feature) => (
+          <Polyline
+            key={feature.id}
+            positions={feature.coordinates}
+            pathOptions={featureStyle(feature)}
+            interactive={Boolean(feature.name)}
           >
-            <span className="waypoint-core">{index + 1}</span>
-            <button
-              className="waypoint-remove"
-              type="button"
-              onClick={(event) => {
-                event.stopPropagation();
-                onClearWaypoint(index);
-              }}
-              aria-label={`Remove waypoint ${index + 1}`}
-            >
-              <X size={10} />
-            </button>
-          </div>
+            {feature.name && <Tooltip sticky>{feature.name}</Tooltip>}
+          </Polyline>
         ))}
-        <div className="map-marker map-marker-target" style={{ left: `${target.x}%`, top: `${target.y}%` }} title="Target point">
-          <span className="marker-core marker-core-target"><Sparkles size={12} /></span>
-          <span className="marker-caption">Target</span>
-        </div>
 
-        <div className="map-placement-hint">
-          {placementMode ? (
-            <>
-              <span className="status-dot status-dot-blue" />
-              Click the map to place {placementMode === "waypoint" ? "a waypoint" : placementMode}
-            </>
-          ) : (
-            <>
-              <span className="status-dot status-dot-slate" />
-              Select a point tool to update the route
-            </>
-          )}
-        </div>
-
-        <div className="map-place-tools" onClick={(event) => event.stopPropagation()}>
-          <button
-            className={`map-place-button ${placementMode === "start" ? "map-place-button-active" : ""}`}
-            type="button"
-            onClick={() => onPlacementModeChange("start")}
+        {view.alternatives.map((alternative, index) => (
+          <Polyline
+            key={alternative.id}
+            positions={routeLatLngs(alternative)}
+            pathOptions={{ color: "#5f7280", weight: 3.5, opacity: 0.55, dashArray: "7 6" }}
+            eventHandlers={{ click: () => onSelectAlternative(index) }}
+            className="route-alternative"
           >
-            <span className="place-dot place-dot-start" />
-            Start
-          </button>
-          <button
-            className={`map-place-button ${placementMode === "target" ? "map-place-button-active" : ""}`}
-            type="button"
-            onClick={() => onPlacementModeChange("target")}
+            <Tooltip sticky>
+              {alternative.objectiveLabel}: {(alternative.distanceMeters / 1_000).toFixed(1)} km,{" "}
+              {Math.round(alternative.estimatedTimeMinutes)} min. Click to use it.
+            </Tooltip>
+          </Polyline>
+        ))}
+
+        {primary && primary.coordinates.length > 1 && (
+          <>
+            <Polyline
+              positions={routeLatLngs(primary)}
+              pathOptions={{ color: "#ffffff", weight: 9, opacity: 0.95, lineCap: "round", lineJoin: "round" }}
+              interactive={false}
+            />
+            {routeStrands(primary).map((strand, index) => (
+              <Polyline
+                key={index}
+                positions={strand.points}
+                pathOptions={{
+                  color: strand.mapped ? "#2a6fc4" : "#3f9a6b",
+                  weight: 4.5,
+                  opacity: 1,
+                  lineCap: "round",
+                  lineJoin: "round",
+                  dashArray: strand.mapped ? undefined : "1 7",
+                }}
+                interactive={false}
+              />
+            ))}
+          </>
+        )}
+
+        {hoverPoint && (
+          <Marker position={[hoverPoint.lat, hoverPoint.lng]} icon={pointIcon("hover", "")} interactive={false} />
+        )}
+
+        <Marker
+          position={[start.lat, start.lng]}
+          icon={pointIcon("start", "A")}
+          draggable
+          eventHandlers={{
+            dragend: (event) => {
+              const { lat, lng } = event.target.getLatLng();
+              onMovePoint("start", 0, { lat, lng });
+            },
+          }}
+        >
+          <Tooltip direction="top" offset={[0, -12]}>Start. Drag to move.</Tooltip>
+        </Marker>
+
+        {waypoints.map((waypoint, index) => (
+          <Marker
+            key={`waypoint-${index}`}
+            position={[waypoint.lat, waypoint.lng]}
+            icon={pointIcon("waypoint", String(index + 1))}
+            draggable
+            eventHandlers={{
+              dragend: (event) => {
+                const { lat, lng } = event.target.getLatLng();
+                onMovePoint("waypoint", index, { lat, lng });
+              },
+            }}
           >
-            <span className="place-dot place-dot-target" />
-            Target
-          </button>
-          <button
-            className={`map-place-button ${placementMode === "waypoint" ? "map-place-button-active" : ""}`}
-            type="button"
-            onClick={() => onPlacementModeChange("waypoint")}
+            <Tooltip direction="top" offset={[0, -12]}>Waypoint {index + 1}. Drag to move.</Tooltip>
+          </Marker>
+        ))}
+
+        {mode !== "nearest" && (
+          <Marker
+            position={[target.lat, target.lng]}
+            icon={pointIcon("target", "B")}
+            draggable
+            eventHandlers={{
+              dragend: (event) => {
+                const { lat, lng } = event.target.getLatLng();
+                onMovePoint("target", 0, { lat, lng });
+              },
+            }}
           >
-            <span className="place-dot place-dot-waypoint">+</span>
-            Waypoint
-          </button>
-        </div>
+            <Tooltip direction="top" offset={[0, -12]}>Target. Drag to move.</Tooltip>
+          </Marker>
+        )}
 
-        <div className="map-controls" onClick={(event) => event.stopPropagation()}>
-          <button className="map-control-button" type="button" aria-label="Zoom in" title="Zoom in">
-            <Plus size={15} />
-          </button>
-          <button className="map-control-button" type="button" aria-label="Zoom out" title="Zoom out">
-            <Minus size={15} />
-          </button>
-          <span className="map-control-divider" />
-          <button className="map-control-button" type="button" aria-label="Locate route" title="Locate route">
-            <LocateFixed size={15} />
-          </button>
-        </div>
+        {mode === "nearest" && primary?.snappedDestination && (
+          <Marker
+            position={[primary.snappedDestination.lat, primary.snappedDestination.lng]}
+            icon={pointIcon("snapped", "")}
+            interactive={false}
+          />
+        )}
 
-        <div className="map-scale" aria-label="Map scale">500 m</div>
+        <MapOverlays>
+          <div className="overlay-corner overlay-top-left">
+            <div className="map-place-tools">
+              {(["start", "target", "waypoint"] as const).map((kind) => (
+                <button
+                  key={kind}
+                  className={`map-place-button ${placementMode === kind ? "map-place-button-active" : ""}`}
+                  type="button"
+                  aria-pressed={placementMode === kind}
+                  disabled={kind === "target" && mode === "nearest"}
+                  onClick={() => togglePlacement(kind)}
+                >
+                  <span className={`place-dot place-dot-${kind}`} />
+                  {kind === "start" ? "Start" : kind === "target" ? "Target" : "Waypoint"}
+                </button>
+              ))}
+            </div>
+            {placementMode && (
+              <div className="map-placement-banner">
+                <Crosshair size={13} />
+                Click the map to place {placementLabel}. It stays selected, so you can keep placing.
+                <button type="button" onClick={() => onPlacementModeChange(null)}>Done</button>
+              </div>
+            )}
+          </div>
 
-        <div className="terrain-chip-row" onClick={(event) => event.stopPropagation()}>
-          {terrainLabels.map((item) => (
-            <span className={`terrain-chip terrain-chip-${item.tone}`} key={item.label} style={{ left: `${item.x}%`, top: `${item.y}%` }}>
-              {item.label}
-            </span>
-          ))}
+          <div className="overlay-corner overlay-top-right">
+            <ZoomControls />
+            <div className="map-layers" ref={layersRef}>
+              <button
+                className={`map-panel-button ${layersOpen ? "map-panel-button-active" : ""}`}
+                type="button"
+                aria-expanded={layersOpen}
+                onClick={() => setLayersOpen((open) => !open)}
+              >
+                <Layers size={13} />
+                Layers
+              </button>
+              {layersOpen && (
+                <div className="map-layer-menu">
+                  <div className="map-layer-menu-title">Map layers</div>
+                  {([
+                    ["tint", "Elevation shading", elevationStatus === "ready"],
+                    ["contours", contourInterval > 0 ? `Contours every ${contourInterval} m` : "Contour lines", elevationStatus === "ready"],
+                    ["paths", "Paths, tracks, streams", true],
+                  ] as const).map(([key, label, enabled]) => (
+                    <label key={key} className={`map-layer-item ${enabled ? "" : "map-layer-item-disabled"}`}>
+                      <input
+                        type="checkbox"
+                        checked={layers[key] && enabled}
+                        disabled={!enabled}
+                        onChange={(event) => onLayersChange({ ...layers, [key]: event.target.checked })}
+                      />
+                      <span className={`layer-check ${layers[key] && enabled ? "layer-check-on" : ""}`} aria-hidden="true" />
+                      <span>{label}</span>
+                    </label>
+                  ))}
+                  <div className="map-legend">
+                    <div className="map-legend-title">Route</div>
+                    <span><i className="legend-swatch legend-swatch-mapped" />Mapped way</span>
+                    <span><i className="legend-swatch legend-swatch-offtrail" />Open terrain</span>
+                    <span><i className="legend-swatch legend-swatch-alternative" />Alternative</span>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="overlay-corner overlay-bottom-left">
+            <div className="map-readout">
+              <span className={`status-dot ${isCalculating ? "status-dot-blue" : view.status === "blocked" ? "status-dot-orange" : "status-dot-green"}`} />
+              {isCalculating
+                ? "Calculating"
+                : view.status === "blocked"
+                  ? "No route under the current limits"
+                  : elevationStatus === "loading"
+                    ? "Loading elevation"
+                    : elevationStatus === "unavailable"
+                      ? "Elevation unavailable"
+                      : cursorElevation !== null
+                        ? `${Math.round(cursorElevation)} m at cursor`
+                        : `${primary ? (primary.distanceMeters / 1_000).toFixed(2) : "0.00"} km route`}
+            </div>
+            <ScaleReadout />
+            <div className="map-attribution">
+              Map data <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors,
+              elevation from <a href="https://registry.opendata.aws/terrain-tiles/">AWS Terrain Tiles</a>
+            </div>
+          </div>
+
+          <div className="overlay-corner overlay-bottom-right">{children}</div>
+        </MapOverlays>
+      </MapContainer>
+
+      {!primary && !isCalculating && (
+        <div className="map-blocked-flag">
+          <RouteIcon size={14} />
+          {view.blockedReason ?? "No route could be drawn."}
         </div>
-      </div>
-    </section>
+      )}
+    </div>
   );
 }
-

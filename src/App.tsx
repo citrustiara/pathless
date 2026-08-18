@@ -1,594 +1,562 @@
 import {
-  Bell,
-  ChevronDown,
-  CircleHelp,
-  Command,
-  Layers3,
+  Bookmark,
+  ChevronsLeft,
+  ChevronsRight,
   Map as MapIcon,
-  Menu,
-  PanelLeft,
-  Search,
-  Settings2,
-  UserRound,
+  Mountain,
+  Save,
 } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ControlsPanel } from "./components/ControlsPanel";
-import { MapCanvas } from "./components/MapCanvas";
+import { MapCanvas, type MapLayers } from "./components/MapCanvas";
 import { RouteSummary } from "./components/RouteSummary";
+import {
+  loadSavedRoutes,
+  persistSavedRoutes,
+  SavedRoutes,
+  type SavedRoute,
+} from "./components/SavedRoutes";
 import type {
   AppMode,
+  ElevationStatus,
   MapPoint,
   PlacementMode,
   ProfileId,
-  RouteGeometry,
-  RouteRequest as UiRouteRequest,
-  RouteResult,
+  RouteRequest,
   RouteSettings,
-  SurfaceShare,
+  RouteView,
 } from "./components/pathless-types";
+import { SOPOCKA_BOUNDS, SOPOCKA_OSM_METADATA, SOPOCKA_WATERWAYS } from "./data/sopocka";
 import {
-  createSyntheticTerrainModel,
-  planRoute,
-  type ActivityProfile,
-  type Coordinate,
-  type RouteAlternative as TerrainRoute,
-  type RouteRequest as TerrainRouteRequest,
+  createTerrainModel,
+  loadElevationGrid,
+  planOSMRoute,
+  type ElevationGrid,
+  type OSMRoute,
+  type OSMRoutingRequest,
+  type TerrainModel,
 } from "./engine";
 
-type UnknownRecord = Record<string, unknown>;
+const ROUTING_CELL_SIZE_METERS = 25;
+const RECALCULATE_DEBOUNCE_MS = 160;
+const MAX_WAYPOINTS = 8;
 
-const terrainModel = createSyntheticTerrainModel();
-
-const initialStart: MapPoint = { x: 17, y: 79, label: "Visitor centre" };
-const initialTarget: MapPoint = { x: 79, y: 22, label: "North ridge overlook" };
-const initialSettings: RouteSettings = {
-  slope: 35,
-  ascent: 56,
-  roughness: 3,
-  pathPreference: 68,
-  allowWater: true,
-  alternatives: true,
+const INITIAL_START: MapPoint = { lat: 54.45804, lng: 18.50919 };
+const INITIAL_TARGET: MapPoint = { lat: 54.46054, lng: 18.50868 };
+const INITIAL_SETTINGS: RouteSettings = {
+  maxGradePercent: 35,
+  offTrailAversion: 2,
+  maxOffTrailMeters: 300,
+  allowStreetCrossing: true,
+  allowStreetWalking: false,
+  avoidWater: false,
+  showAlternatives: true,
 };
+const INITIAL_LAYERS: MapLayers = { tint: true, contours: true, paths: true };
 
-const initialProfile: ProfileId = "hiker";
-const initialMode: AppMode = "destination";
+/** The routing grid never changes shape, only the elevation poured into it. */
+const buildTerrain = (elevation?: ElevationGrid): TerrainModel => createTerrainModel({
+  bounds: SOPOCKA_BOUNDS,
+  elevation,
+  cellSizeMeters: ROUTING_CELL_SIZE_METERS,
+  waterways: SOPOCKA_WATERWAYS,
+  id: "sopocka-25m",
+  name: "Sopocka 25 m routing grid",
+});
 
-const profileSpeed: Record<ProfileId, number> = {
-  hiker: 4.5,
-  runner: 7.2,
-  "all-terrain": 5.1,
-};
+const toRoutingRequest = (request: RouteRequest): OSMRoutingRequest => ({
+  mode: request.mode,
+  origin: request.start,
+  destination: request.mode === "nearest" ? undefined : request.target,
+  waypoints: request.mode === "design" ? request.waypoints : [],
+  profile: request.profile,
+  maxGradePercent: request.settings.maxGradePercent,
+  offTrailAversion: request.settings.offTrailAversion,
+  maxOffTrailMeters: request.settings.maxOffTrailMeters,
+  allowStreetCrossing: request.settings.allowStreetCrossing,
+  allowStreetWalking: request.settings.allowStreetWalking,
+  avoidWater: request.settings.avoidWater,
+  alternatives: request.settings.showAlternatives ? 3 : 1,
+});
 
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.min(maximum, Math.max(minimum, value));
-}
+const shareOf = (part: number, whole: number): number =>
+  Math.round((part / Math.max(whole, 1)) * 100);
 
-function asRecord(value: unknown): UnknownRecord | null {
-  return typeof value === "object" && value !== null ? value as UnknownRecord : null;
-}
-
-function numberFrom(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-function firstNumber(record: UnknownRecord, keys: string[], fallback: number): number {
-  for (const key of keys) {
-    const value = record[key];
-    if (typeof value === "number" && Number.isFinite(value)) return value;
-  }
-  return fallback;
-}
-
-function firstText(record: UnknownRecord, keys: string[], fallback: string): string {
-  for (const key of keys) {
-    const value = record[key];
-    if (typeof value === "string" && value.trim()) return value;
-  }
-  return fallback;
-}
-
-function interpolate(a: MapPoint, b: MapPoint, fraction: number, offset: number): MapPoint {
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const length = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-  const normalX = -dy / length;
-  const normalY = dx / length;
-  return {
-    x: clamp(a.x + dx * fraction + normalX * offset, 3, 97),
-    y: clamp(a.y + dy * fraction + normalY * offset, 4, 96),
-  };
-}
-
-function buildSegment(a: MapPoint, b: MapPoint, bend: number): MapPoint[] {
-  return [
-    a,
-    interpolate(a, b, 0.17, bend * 0.38),
-    interpolate(a, b, 0.34, bend),
-    interpolate(a, b, 0.52, bend * 0.78),
-    interpolate(a, b, 0.7, bend * 0.25),
-    interpolate(a, b, 0.86, -bend * 0.28),
-    b,
-  ];
-}
-
-function buildRoutePath(points: MapPoint[], bend: number): MapPoint[] {
-  if (points.length < 2) return points;
-  return points.slice(0, -1).flatMap((point, index) => {
-    const segment = buildSegment(point, points[index + 1], bend * (index % 2 === 0 ? 1 : -0.76));
-    return index === 0 ? segment : segment.slice(1);
-  });
-}
-
-function buildGeometry(path: MapPoint[]): RouteGeometry {
-  return {
-    coordinateOrder: "lon-lat",
-    coordinates: path.map((point) => [24.91 + (point.x - 50) * 0.0085, 62.91 - (point.y - 50) * 0.0065]),
-  };
-}
-
-function coordinateForMapPoint(point: MapPoint): Coordinate {
-  const { north, south, east, west } = terrainModel.bounds;
-  return {
-    lat: south + (1 - point.y / 100) * (north - south),
-    lng: west + (point.x / 100) * (east - west),
-  };
-}
-
-function mapPointForCoordinate(coordinate: Coordinate): MapPoint {
-  const { north, south, east, west } = terrainModel.bounds;
-  return {
-    x: clamp(((coordinate.lng - west) / (east - west)) * 100, 3, 97),
-    y: clamp((1 - (coordinate.lat - south) / (north - south)) * 100, 4, 96),
-    label: "Terrain engine point",
-  };
-}
-
-function makeSurface(pathPreference: number, roughness: number, allowWater: boolean): SurfaceShare[] {
-  const trail = clamp(Math.round(37 + pathPreference * 0.35), 35, 70);
-  const rough = clamp(Math.round(18 + roughness * 4 + (allowWater ? 0 : 5)), 17, 42);
-  const inferred = 100 - trail - rough;
-  return [
-    { label: "Known path", value: trail, color: "blue" },
-    { label: "Terrain model", value: inferred, color: "green" },
-    { label: "Unmapped", value: rough, color: "orange" },
-  ];
-}
-
-function createFallbackRoute(request: UiRouteRequest): RouteResult {
-  const routePoints = [request.start, ...request.waypoints, request.target];
-  const directDistance = routePoints.slice(0, -1).reduce((total, point, index) => {
-    const next = routePoints[index + 1];
-    return total + Math.sqrt((next.x - point.x) ** 2 + (next.y - point.y) ** 2);
-  }, 0);
-  const pathPreferenceFactor = 0.96 + request.settings.pathPreference / 240;
-  const distanceKm = clamp(directDistance * 0.083 * pathPreferenceFactor + request.waypoints.length * 0.11, 1.6, 18.4);
-  const speed = profileSpeed[request.profile];
-  const surfacePenalty = 1 + (request.settings.roughness - 2) * 0.045;
-  const durationMin = Math.round((distanceKm / speed) * 60 * surfacePenalty + request.settings.ascent * 0.08);
-  const elevationGainM = Math.round(112 + request.settings.ascent * 1.32 + request.settings.roughness * 9 + request.waypoints.length * 8);
-  const elevationLossM = Math.round(elevationGainM * 0.72);
-  const slope = clamp(Math.round(request.settings.slope * 0.48 + request.settings.roughness * 1.3), 12, 44);
-  const bend = clamp((request.settings.pathPreference - 50) / 10, -2.5, 3.5);
-  const routePath = buildRoutePath(routePoints, bend);
-  const alternatives = request.settings.alternatives
-    ? [buildRoutePath(routePoints, bend + 4.7), buildRoutePath(routePoints, bend - 5.8)]
-    : [];
-  const title = request.mode === "nearest" ? "Nearest reliable path" : request.mode === "design" ? "Designed ridge traverse" : "North ridge traverse";
-  const subtitle = request.mode === "nearest"
-    ? "Best available connection from your start point"
-    : request.mode === "design"
-      ? `${request.waypoints.length} waypoint${request.waypoints.length === 1 ? "" : "s"} · terrain-aware preview`
-      : "Visitor centre to North ridge overlook";
-
-  return {
-    title,
-    subtitle,
-    distanceKm,
-    durationMin,
-    elevationGainM,
-    elevationLossM,
-    maxSlopePct: slope,
-    confidence: clamp(0.84 - request.settings.roughness * 0.025 + (request.settings.pathPreference > 55 ? 0.03 : 0), 0.62, 0.94),
-    sourceLabel: "Terrain engine v0.4",
-    routePath,
-    alternatives,
-    geometry: buildGeometry(routePath),
-    surface: makeSurface(request.settings.pathPreference, request.settings.roughness, request.settings.allowWater),
-    notes: [
-      request.settings.allowWater ? "Crosses one seasonal creek at a shallow ford" : "Avoids the seasonal creek with a short detour",
-      request.settings.pathPreference > 60 ? "Follows mapped trail where available" : "Uses a shorter line through open terrain",
-      request.settings.roughness > 3 ? "Expect loose ground for the final 900 m" : "Ground conditions look consistent for the season",
-    ],
-  };
-}
-
-function terrainProfileFor(profile: ProfileId): ActivityProfile {
-  return profile === "all-terrain" ? "mtb" : "walking";
-}
-
-function terrainRequestFor(request: UiRouteRequest): TerrainRouteRequest {
-  const mode = request.mode === "nearest"
-    ? "nearest-mapped-path"
-    : request.mode === "design"
-      ? "design-route"
-      : "selected-destination";
-
-  return {
-    mode,
-    origin: coordinateForMapPoint(request.start),
-    destination: mode === "nearest-mapped-path" ? undefined : coordinateForMapPoint(request.target),
-    waypoints: mode === "design-route" ? request.waypoints.map(coordinateForMapPoint) : [],
-    profile: terrainProfileFor(request.profile),
-    preferences: {
-      slopeTolerance: request.settings.slope * 0.52,
-      ascentPreference: 1 - (request.settings.ascent / 50),
-      ascentBudget: null,
-      roughness: request.settings.roughness / 5,
-      pathPreference: request.settings.pathPreference / 100,
-      waterAvoidance: request.settings.allowWater ? 0.35 : 1,
-    },
-    alternatives: request.settings.alternatives ? 3 : 1,
-  };
-}
-
-function surfaceForTerrainRoute(route: TerrainRoute): SurfaceShare[] {
-  const distance = Math.max(route.metrics.distanceMeters, 1);
-  const mapped = Math.round((route.metrics.mappedDistanceMeters / distance) * 100);
-  const water = Math.round((route.metrics.waterDistanceMeters / distance) * 100);
-  const terrain = Math.max(0, 100 - mapped - water);
-  const surfaces: SurfaceShare[] = [
-    { label: "Known path", value: mapped, color: "blue" },
-    { label: "Terrain model", value: terrain, color: "green" },
-    { label: "Water risk", value: water, color: "orange" },
-  ];
-  return surfaces.filter((surface) => surface.value > 0);
-}
-
-function terrainRouteToUiRoute(
-  route: TerrainRoute,
-  request: UiRouteRequest,
-): RouteResult {
-  const mappedShare = Math.round(route.evidenceBreakdown.mappedPath * 100);
-  const inferredShare = Math.round(route.evidenceBreakdown.inferred * 100);
-  const maxSlopePct = Math.round(Math.tan((route.metrics.maxSlopeDegrees * Math.PI) / 180) * 100);
-  const title = request.mode === "nearest"
-    ? `${route.objectiveLabel} path`
-    : request.mode === "design"
-      ? `${route.objectiveLabel} designed route`
-      : `${route.objectiveLabel} destination route`;
-  const subtitle = request.mode === "nearest"
-    ? "Best available connection from your start point"
-    : request.mode === "design"
-      ? `${request.waypoints.length} waypoint${request.waypoints.length === 1 ? "" : "s"} · terrain-aware preview`
-      : "Terrain-aware route across the pilot area";
-
+const buildNotes = (route: OSMRoute, request: RouteRequest, terrain: TerrainModel): string[] => {
+  const mapped = shareOf(route.mappedDistanceMeters, route.distanceMeters);
   const notes = [
-    mappedShare > 0
-      ? `Uses mapped-path evidence for ${mappedShare}% of the route`
-      : "No mapped path evidence on this route",
-    inferredShare > 0
-      ? `${inferredShare}% follows terrain inference rather than a known path`
-      : "Route stays on known path evidence",
-    route.metrics.waterDistanceMeters > 1
-      ? "Crosses water-risk cells because no cheaper dry route was found"
-      : "Avoids water-risk cells in the terrain model",
+    mapped > 0
+      ? `${mapped}% of the route follows ways that are mapped in OpenStreetMap.`
+      : "No mapped way is used; the whole route crosses open ground.",
+    route.offTrailDistanceMeters > 0
+      ? `${Math.round(route.offTrailDistanceMeters)} m is off-trail, the longest single stretch being ${Math.round(route.longestOffTrailMeters)} m.`
+      : "The route never leaves a mapped way.",
+    terrain.hasElevation
+      ? "Climb, grade, and time come from a public elevation model at roughly 12 m spacing."
+      : "Elevation was unavailable, so climb and grade are reported as zero rather than guessed.",
+    "Ground cover is not modelled: undergrowth, deadfall, and fences will not appear here.",
+    request.settings.allowStreetCrossing
+      ? "Street crossings are allowed anywhere, including where no crossing is mapped."
+      : "Streets are only crossed where OpenStreetMap maps a crossing.",
   ];
+  if (route.waterDistanceMeters > 0) {
+    notes.push(`${Math.round(route.waterDistanceMeters)} m runs close to a mapped watercourse.`);
+  }
+  return notes;
+};
+
+const buildView = (
+  request: RouteRequest,
+  terrain: TerrainModel,
+  preferredObjective?: string,
+): RouteView => {
+  const result = planOSMRoute(toRoutingRequest(request), terrain);
+  if (result.routes.length === 0) {
+    return {
+      status: "blocked",
+      title: "No feasible route",
+      subtitle: request.mode === "nearest"
+        ? "No mapped path can be reached from the start under these limits"
+        : "The target cannot be reached under these limits",
+      alternatives: [],
+      notes: [],
+      blockedReason: result.errors[0],
+    };
+  }
+
+  const preferredIndex = preferredObjective
+    ? result.routes.findIndex((route) => route.objective === preferredObjective)
+    : -1;
+  const chosen = preferredIndex >= 0 ? preferredIndex : 0;
+  const primary = result.routes[chosen];
 
   return {
-    title,
-    subtitle,
-    distanceKm: route.metrics.distanceKilometers,
-    durationMin: Math.max(1, Math.round(route.metrics.estimatedTimeMinutes)),
-    elevationGainM: Math.round(route.metrics.ascentMeters),
-    elevationLossM: Math.round(route.metrics.descentMeters),
-    maxSlopePct,
-    confidence: route.metrics.confidence,
-    sourceLabel: "Synthetic terrain engine",
-    routePath: route.coordinates.map(mapPointForCoordinate),
-    alternatives: [],
-    geometry: {
-      coordinateOrder: "lon-lat",
-      coordinates: route.coordinates.map(({ lng, lat }) => [lng, lat]),
+    status: "ready",
+    title: request.mode === "nearest"
+      ? "Nearest mapped path"
+      : request.mode === "design"
+        ? `Route through ${request.waypoints.length} waypoint${request.waypoints.length === 1 ? "" : "s"}`
+        : "Route to target",
+    subtitle: primary.wayNames.length > 0
+      ? `Mostly ${primary.wayNames.slice(0, 2).join(" and ")}`
+      : `${shareOf(primary.mappedDistanceMeters, primary.distanceMeters)}% on mapped ways`,
+    route: primary,
+    alternatives: result.routes.filter((_, index) => index !== chosen),
+    notes: buildNotes(primary, request, terrain),
+  };
+};
+
+const encodePoint = (point: MapPoint): string => `${point.lat.toFixed(5)},${point.lng.toFixed(5)}`;
+
+const decodePoint = (value: string | null): MapPoint | undefined => {
+  if (!value) return undefined;
+  const [lat, lng] = value.split(",").map(Number);
+  return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : undefined;
+};
+
+type PersistedState = {
+  mode: AppMode;
+  profile: ProfileId;
+  settings: RouteSettings;
+  start: MapPoint;
+  target: MapPoint;
+  waypoints: MapPoint[];
+};
+
+const readStateFromUrl = (): Partial<PersistedState> => {
+  const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+  if ([...params.keys()].length === 0) return {};
+  const number = (key: string, fallback: number): number => {
+    const parsed = Number(params.get(key));
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  const flag = (key: string, fallback: boolean): boolean => {
+    const raw = params.get(key);
+    return raw === null ? fallback : raw === "1";
+  };
+
+  return {
+    mode: (["nearest", "destination", "design"] as const).find((value) => value === params.get("m")),
+    profile: (["hiker", "runner", "mtb"] as const).find((value) => value === params.get("p")),
+    start: decodePoint(params.get("s")),
+    target: decodePoint(params.get("t")),
+    waypoints: (params.get("w") ?? "")
+      .split(";")
+      .map(decodePoint)
+      .filter((point): point is MapPoint => Boolean(point)),
+    settings: {
+      maxGradePercent: number("g", INITIAL_SETTINGS.maxGradePercent),
+      offTrailAversion: number("e", INITIAL_SETTINGS.offTrailAversion),
+      maxOffTrailMeters: number("o", INITIAL_SETTINGS.maxOffTrailMeters),
+      allowStreetCrossing: flag("xc", INITIAL_SETTINGS.allowStreetCrossing),
+      allowStreetWalking: flag("xw", INITIAL_SETTINGS.allowStreetWalking),
+      avoidWater: flag("aw", INITIAL_SETTINGS.avoidWater),
+      showAlternatives: flag("alt", INITIAL_SETTINGS.showAlternatives),
     },
-    surface: surfaceForTerrainRoute(route),
-    notes,
   };
-}
+};
 
-function calculateWithTerrainEngine(request: UiRouteRequest, fallback: RouteResult): RouteResult {
-  const result = planRoute(terrainRequestFor(request), { terrain: terrainModel });
-  const primary = result.primaryRoute;
-  if (!primary || result.errors.length > 0) {
-    return fallback;
-  }
+const writeStateToUrl = (state: PersistedState): void => {
+  const params = new URLSearchParams({
+    m: state.mode,
+    p: state.profile,
+    s: encodePoint(state.start),
+    t: encodePoint(state.target),
+    g: String(state.settings.maxGradePercent),
+    e: String(state.settings.offTrailAversion),
+    o: String(state.settings.maxOffTrailMeters),
+    xc: state.settings.allowStreetCrossing ? "1" : "0",
+    xw: state.settings.allowStreetWalking ? "1" : "0",
+    aw: state.settings.avoidWater ? "1" : "0",
+    alt: state.settings.showAlternatives ? "1" : "0",
+  });
+  if (state.waypoints.length > 0) params.set("w", state.waypoints.map(encodePoint).join(";"));
+  window.history.replaceState(null, "", `#${params.toString()}`);
+};
 
-  const primaryUi = terrainRouteToUiRoute(primary, request);
-  return {
-    ...primaryUi,
-    alternatives: result.routes.slice(1).map((alternative) =>
-      alternative.coordinates.map(mapPointForCoordinate),
-    ),
-  };
-}
-
-// The prototype can run on its local fallback while the engine/data modules are absent
-// from this checkout. These dynamic imports keep the UI compatible with the supplied
-// Pathless modules when they are present, without adding or changing engine code here.
-async function loadPathlessModules(): Promise<{ engine: UnknownRecord | null; demo: UnknownRecord | null }> {
-  const [engine, demo] = await Promise.all([
-    (async () => {
-      try {
-        // @ts-ignore The engine module is supplied by the host prototype when available.
-        return await import(/* @vite-ignore */ "./engine") as UnknownRecord;
-      } catch {
-        return null;
-      }
-    })(),
-    (async () => {
-      try {
-        // @ts-ignore Demo data is optional in the minimal repository checkout.
-        return await import(/* @vite-ignore */ "./data/demo") as UnknownRecord;
-      } catch {
-        return null;
-      }
-    })(),
-  ]);
-  return { engine, demo };
-}
-
-function readCoordinates(value: unknown): RouteGeometry | undefined {
-  const record = asRecord(value);
-  if (record?.type === "Feature") return readCoordinates(record.geometry);
-  if (record?.type === "LineString") return readCoordinates(record.coordinates);
-
-  if (!Array.isArray(value)) return undefined;
-  const coordinates: Array<[number, number]> = [];
-  for (const point of value) {
-    if (!Array.isArray(point) || point.length < 2) continue;
-    const first = numberFrom(point[0], Number.NaN);
-    const second = numberFrom(point[1], Number.NaN);
-    if (Number.isFinite(first) && Number.isFinite(second)) coordinates.push([first, second]);
-  }
-  if (coordinates.length < 2) return undefined;
-  const looksLikeLatLon = coordinates.every(([first, second]) => Math.abs(first) <= 90 && Math.abs(second) <= 180) && coordinates.some(([first]) => Math.abs(first) > 90);
-  return { coordinates, coordinateOrder: looksLikeLatLon ? "lat-lon" : "lon-lat" };
-}
-
-function findGeometry(value: unknown): RouteGeometry | undefined {
-  const record = asRecord(value);
-  if (!record) return readCoordinates(value);
-  const candidates = [record.geometry, record.routeGeometry, record.path, record.coordinates, record.lineString];
-  for (const candidate of candidates) {
-    const geometry = readCoordinates(candidate);
-    if (geometry) return geometry;
-  }
-  return undefined;
-}
-
-function projectGeometry(geometry: RouteGeometry): MapPoint[] {
-  const xIndex = geometry.coordinateOrder === "lon-lat" ? 0 : 1;
-  const yIndex = geometry.coordinateOrder === "lon-lat" ? 1 : 0;
-  const xs = geometry.coordinates.map((coordinate) => coordinate[xIndex]);
-  const ys = geometry.coordinates.map((coordinate) => coordinate[yIndex]);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const minY = Math.min(...ys);
-  const maxY = Math.max(...ys);
-  const rangeX = Math.max(0.00001, maxX - minX);
-  const rangeY = Math.max(0.00001, maxY - minY);
-  return geometry.coordinates.map((coordinate) => ({
-    x: 12 + ((coordinate[xIndex] - minX) / rangeX) * 76,
-    y: 16 + (1 - (coordinate[yIndex] - minY) / rangeY) * 68,
+const downloadRoute = (format: "gpx" | "geojson", route: OSMRoute, terrain: TerrainModel): void => {
+  const points = route.coordinates.map((coordinate) => ({
+    ...coordinate,
+    ele: terrain.hasElevation ? terrain.elevationAt(coordinate) : undefined,
   }));
-}
-
-function unwrapExternalResult(value: unknown): UnknownRecord | null {
-  const record = asRecord(value);
-  if (!record) return null;
-  const nested = [record.route, record.result, record.data, record.output];
-  for (const candidate of nested) {
-    const nestedRecord = asRecord(candidate);
-    if (nestedRecord) return nestedRecord;
-  }
-  return record;
-}
-
-function normaliseExternalRoute(value: unknown, fallback: RouteResult): RouteResult | null {
-  const record = unwrapExternalResult(value);
-  if (!record) return null;
-  const geometry = findGeometry(record);
-  const routePath = geometry ? projectGeometry(geometry) : fallback.routePath;
-  const confidenceRaw = firstNumber(record, ["confidence", "score", "reliability"], fallback.confidence);
-  const confidence = confidenceRaw > 1 ? confidenceRaw / 100 : confidenceRaw;
-  const rawSurface = Array.isArray(record.surface) ? record.surface : Array.isArray(record.surfaceProfile) ? record.surfaceProfile : null;
-  const surface = rawSurface
-    ? rawSurface.flatMap((item): SurfaceShare[] => {
-      const itemRecord = asRecord(item);
-      if (!itemRecord) return [];
-      const value = clamp(firstNumber(itemRecord, ["value", "percent", "share"], 0), 0, 100);
-      const label = firstText(itemRecord, ["label", "name", "type"], "Terrain");
-      const tone = firstText(itemRecord, ["color", "tone"], "green");
-      const color: SurfaceShare["color"] = tone === "blue" || tone === "orange" || tone === "slate" ? tone : "green";
-      return [{ label, value, color }];
-    })
-    : fallback.surface;
-  return {
-    ...fallback,
-    title: firstText(record, ["title", "name"], fallback.title),
-    subtitle: firstText(record, ["subtitle", "description"], fallback.subtitle),
-    distanceKm: firstNumber(record, ["distanceKm", "distance", "lengthKm"], fallback.distanceKm),
-    durationMin: firstNumber(record, ["durationMin", "timeMin", "duration"], fallback.durationMin),
-    elevationGainM: firstNumber(record, ["elevationGainM", "ascent", "gain"], fallback.elevationGainM),
-    elevationLossM: firstNumber(record, ["elevationLossM", "descent", "loss"], fallback.elevationLossM),
-    maxSlopePct: firstNumber(record, ["maxSlopePct", "maxSlope", "slope"], fallback.maxSlopePct),
-    confidence: clamp(confidence, 0, 1),
-    sourceLabel: firstText(record, ["sourceLabel", "source"], "Terrain engine"),
-    routePath,
-    geometry,
-    surface,
-  };
-}
-
-function calculateWithEngine(_engine: UnknownRecord | null, request: UiRouteRequest, fallback: RouteResult): RouteResult {
-  return calculateWithTerrainEngine(request, fallback);
-}
-
-function routeRequest(mode: AppMode, profile: ProfileId, settings: RouteSettings, start: MapPoint, target: MapPoint, waypoints: MapPoint[]): UiRouteRequest {
-  return { mode, profile, settings, start, target, waypoints };
-}
-
-function downloadRoute(format: "gpx" | "geojson", geometry: RouteGeometry) {
-  const coordinates = geometry.coordinateOrder === "lon-lat"
-    ? geometry.coordinates
-    : geometry.coordinates.map(([lat, lon]) => [lon, lat] as [number, number]);
   let content: string;
   let mimeType: string;
   let extension: string;
+
   if (format === "gpx") {
-    const points = coordinates.map(([lon, lat]) => `      <trkpt lat="${lat.toFixed(6)}" lon="${lon.toFixed(6)}"></trkpt>`).join("\n");
-    content = `<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="Pathless"><trk><name>North ridge traverse</name><trkseg>\n${points}\n</trkseg></trk></gpx>`;
+    const body = points.map(({ lat, lng, ele }) =>
+      `      <trkpt lat="${lat.toFixed(6)}" lon="${lng.toFixed(6)}">${ele === undefined ? "" : `<ele>${ele.toFixed(1)}</ele>`}</trkpt>`,
+    ).join("\n");
+    content = `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="Pathless" xmlns="http://www.topografix.com/GPX/1/1">
+  <metadata><name>Pathless route</name></metadata>
+  <trk><name>Pathless route</name><trkseg>
+${body}
+  </trkseg></trk>
+</gpx>`;
     mimeType = "application/gpx+xml";
     extension = "gpx";
   } else {
-    content = JSON.stringify({ type: "Feature", properties: { name: "North ridge traverse", source: "Pathless" }, geometry: { type: "LineString", coordinates } }, null, 2);
+    content = JSON.stringify({
+      type: "Feature",
+      properties: {
+        name: "Pathless route",
+        distanceMeters: Math.round(route.distanceMeters),
+        estimatedTimeMinutes: Math.round(route.estimatedTimeMinutes),
+        ascentMeters: Math.round(route.ascentMeters),
+        descentMeters: Math.round(route.descentMeters),
+      },
+      geometry: {
+        type: "LineString",
+        coordinates: points.map(({ lat, lng, ele }) =>
+          ele === undefined ? [lng, lat] : [lng, lat, Number(ele.toFixed(1))]),
+      },
+    }, null, 2);
     mimeType = "application/geo+json";
     extension = "geojson";
   }
+
   const url = URL.createObjectURL(new Blob([content], { type: mimeType }));
   const link = document.createElement("a");
   link.href = url;
-  link.download = `pathless-north-ridge.${extension}`;
+  link.download = `pathless-route.${extension}`;
   link.click();
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
-}
+};
 
 export function App() {
-  const [mode, setMode] = useState<AppMode>(initialMode);
-  const [profile, setProfile] = useState<ProfileId>(initialProfile);
-  const [settings, setSettings] = useState<RouteSettings>(initialSettings);
-  const [start, setStart] = useState<MapPoint>(initialStart);
-  const [target, setTarget] = useState<MapPoint>(initialTarget);
-  const [waypoints, setWaypoints] = useState<MapPoint[]>([]);
+  const initial = useMemo(readStateFromUrl, []);
+  const [mode, setMode] = useState<AppMode>(initial.mode ?? "destination");
+  const [profile, setProfile] = useState<ProfileId>(initial.profile ?? "hiker");
+  const [settings, setSettings] = useState<RouteSettings>(initial.settings ?? INITIAL_SETTINGS);
+  const [start, setStart] = useState<MapPoint>(initial.start ?? INITIAL_START);
+  const [target, setTarget] = useState<MapPoint>(initial.target ?? INITIAL_TARGET);
+  const [waypoints, setWaypoints] = useState<MapPoint[]>(initial.waypoints ?? []);
   const [placementMode, setPlacementMode] = useState<PlacementMode>(null);
-  const [isCalculating, setIsCalculating] = useState(false);
-  const engine = true;
-  const initialRequest = routeRequest(initialMode, initialProfile, initialSettings, initialStart, initialTarget, []);
-  const [route, setRoute] = useState<RouteResult>(() =>
-    calculateWithTerrainEngine(initialRequest, createFallbackRoute(initialRequest)),
+  const [layers, setLayers] = useState<MapLayers>(INITIAL_LAYERS);
+  const [detailsHidden, setDetailsHidden] = useState(false);
+  const [railCollapsed, setRailCollapsed] = useState(false);
+  const [section, setSection] = useState<"explorer" | "saved">("explorer");
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const [savedRoutes, setSavedRoutes] = useState<SavedRoute[]>(() => loadSavedRoutes());
+  const [preferredObjective, setPreferredObjective] = useState<string | undefined>();
+
+  const [elevation, setElevation] = useState<ElevationGrid | undefined>();
+  const [elevationStatus, setElevationStatus] = useState<ElevationStatus>("loading");
+  const terrain = useMemo(() => buildTerrain(elevation), [elevation]);
+
+  const request = useMemo<RouteRequest>(
+    () => ({ mode, profile, settings, start, target, waypoints }),
+    [mode, profile, settings, start, target, waypoints],
   );
 
-  const currentRequest = useMemo(() => routeRequest(mode, profile, settings, start, target, waypoints), [mode, profile, settings, start, target, waypoints]);
+  const [view, setView] = useState<RouteView>(() => buildView(request, buildTerrain()));
+  const [isCalculating, setIsCalculating] = useState(false);
+  const latestRequest = useRef(request);
+  latestRequest.current = request;
 
-  const recalculate = useCallback(async (request: UiRouteRequest = currentRequest) => {
-    setIsCalculating(true);
-    await new Promise<void>((resolve) => window.setTimeout(resolve, 360));
-    const fallback = createFallbackRoute(request);
-    const calculated = calculateWithEngine(engine ? {} : null, request, fallback);
-    setRoute(calculated);
-    setPlacementMode(null);
-    setIsCalculating(false);
-  }, [currentRequest]);
-
-  const handleMapClick = useCallback((point: MapPoint) => {
-    const nextPoint = { ...point, label: "Map point" };
-    if (placementMode === "start") setStart(nextPoint);
-    if (placementMode === "target") setTarget(nextPoint);
-    if (placementMode === "waypoint" && waypoints.length < 5) setWaypoints((current) => [...current, nextPoint]);
-    if (placementMode) {
-      const nextStart = placementMode === "start" ? nextPoint : start;
-      const nextTarget = placementMode === "target" ? nextPoint : target;
-      const nextWaypoints = placementMode === "waypoint" && waypoints.length < 5 ? [...waypoints, nextPoint] : waypoints;
-      const nextRequest = routeRequest(mode, profile, settings, nextStart, nextTarget, nextWaypoints);
-      setRoute(calculateWithTerrainEngine(nextRequest, createFallbackRoute(nextRequest)));
-      setPlacementMode(null);
-    }
-  }, [mode, placementMode, profile, settings, start, target, waypoints]);
-
-  const handleReset = useCallback(() => {
-    setMode(initialMode);
-    setProfile(initialProfile);
-    setSettings(initialSettings);
-    setStart(initialStart);
-    setTarget(initialTarget);
-    setWaypoints([]);
-    setPlacementMode(null);
-    setRoute(calculateWithTerrainEngine(initialRequest, createFallbackRoute(initialRequest)));
+  useEffect(() => {
+    let cancelled = false;
+    loadElevationGrid(SOPOCKA_BOUNDS)
+      .then((grid) => {
+        if (cancelled) return;
+        setElevation(grid);
+        setElevationStatus("ready");
+      })
+      .catch(() => {
+        if (!cancelled) setElevationStatus("unavailable");
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  const handleClearWaypoint = useCallback((index: number) => {
-    const nextWaypoints = waypoints.filter((_, waypointIndex) => waypointIndex !== index);
-    setWaypoints(nextWaypoints);
-    const nextRequest = routeRequest(mode, profile, settings, start, target, nextWaypoints);
-    setRoute(calculateWithTerrainEngine(nextRequest, createFallbackRoute(nextRequest)));
+  // Routing is fast enough to run on every change, but a slider drag would
+  // still fire dozens of times a second without this.
+  useEffect(() => {
+    setIsCalculating(true);
+    const timer = window.setTimeout(() => {
+      setView(buildView(request, terrain, preferredObjective));
+      setIsCalculating(false);
+    }, RECALCULATE_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [preferredObjective, request, terrain]);
+
+  useEffect(() => {
+    writeStateToUrl({ mode, profile, settings, start, target, waypoints });
   }, [mode, profile, settings, start, target, waypoints]);
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (key === "escape") setPlacementMode(null);
+      if (key === "s") setPlacementMode((current) => (current === "start" ? null : "start"));
+      if (key === "t" && mode !== "nearest") {
+        setPlacementMode((current) => (current === "target" ? null : "target"));
+      }
+      if (key === "w" && mode === "design") {
+        setPlacementMode((current) => (current === "waypoint" ? null : "waypoint"));
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [mode]);
+
+  const handleMapClick = useCallback((point: MapPoint) => {
+    if (placementMode === "start") setStart(point);
+    if (placementMode === "target") setTarget(point);
+    if (placementMode === "waypoint") {
+      setWaypoints((current) => (current.length < MAX_WAYPOINTS ? [...current, point] : current));
+    }
+    // The placement mode deliberately stays active so several points can be
+    // dropped in a row; Esc or the Done button ends it.
+  }, [placementMode]);
+
+  const handleMovePoint = useCallback(
+    (kind: "start" | "target" | "waypoint", index: number, point: MapPoint) => {
+      if (kind === "start") setStart(point);
+      if (kind === "target") setTarget(point);
+      if (kind === "waypoint") {
+        setWaypoints((current) => current.map((existing, position) => (position === index ? point : existing)));
+      }
+    },
+    [],
+  );
+
+  const handleReset = useCallback(() => {
+    setMode("destination");
+    setProfile("hiker");
+    setSettings(INITIAL_SETTINGS);
+    setStart(INITIAL_START);
+    setTarget(INITIAL_TARGET);
+    setWaypoints([]);
+    setPlacementMode(null);
+    setPreferredObjective(undefined);
+  }, []);
+
+  const handleSelectAlternative = useCallback((index: number) => {
+    const alternative = view.alternatives[index];
+    if (alternative) setPreferredObjective(alternative.objective);
+  }, [view.alternatives]);
+
+  const handleSaveRoute = useCallback(() => {
+    if (!view.route) return;
+    const entry: SavedRoute = {
+      id: `${Date.now()}`,
+      name: view.title,
+      savedAt: Date.now(),
+      mode,
+      profile,
+      settings,
+      start,
+      target,
+      waypoints,
+      distanceMeters: view.route.distanceMeters,
+      durationMinutes: view.route.estimatedTimeMinutes,
+    };
+    const next = [entry, ...savedRoutes].slice(0, 30);
+    setSavedRoutes(next);
+    persistSavedRoutes(next);
+    setSection("saved");
+  }, [mode, profile, savedRoutes, settings, start, target, view.route, view.title, waypoints]);
+
+  const handleRestoreRoute = useCallback((saved: SavedRoute) => {
+    setMode(saved.mode);
+    setProfile(saved.profile);
+    setSettings(saved.settings);
+    setStart(saved.start);
+    setTarget(saved.target);
+    setWaypoints(saved.waypoints);
+    setSection("explorer");
+  }, []);
+
+  const handleDeleteRoute = useCallback((id: string) => {
+    setSavedRoutes((current) => {
+      const next = current.filter((route) => route.id !== id);
+      persistSavedRoutes(next);
+      return next;
+    });
+  }, []);
+
+  const hoverPoint = hoverIndex !== null && view.route?.coordinates[hoverIndex]
+    ? view.route.coordinates[hoverIndex]
+    : null;
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${railCollapsed ? "app-shell-rail-collapsed" : ""}`}>
       <aside className="left-rail">
-        <div className="brand-mark"><span className="brand-glyph"><span /><span /><span /></span><span>PATHLESS</span></div>
-        <div className="rail-workspace-select">
-          <span className="workspace-avatar">F</span>
-          <span><strong>Field operations</strong><small>Personal workspace</small></span>
-          <ChevronDown size={13} />
+        <div className="brand-mark">
+          <span className="brand-glyph"><span /><span /><span /></span>
+          <span className="brand-name">PATHLESS</span>
         </div>
         <nav className="rail-nav" aria-label="Primary navigation">
-          <div className="rail-nav-label">Workspace</div>
-          <a className="rail-link rail-link-active" href="#map"><MapIcon size={16} /><span>Route explorer</span><span className="rail-link-count">1</span></a>
-          <a className="rail-link" href="#saved"><Layers3 size={16} /><span>Saved routes</span></a>
-          <a className="rail-link" href="#datasets"><Command size={16} /><span>Terrain datasets</span></a>
-          <div className="rail-nav-label rail-nav-label-spaced">Manage</div>
-          <a className="rail-link" href="#settings"><Settings2 size={16} /><span>Workspace settings</span></a>
-          <a className="rail-link" href="#help"><CircleHelp size={16} /><span>Help & feedback</span></a>
+          <button
+            className={`rail-link ${section === "explorer" ? "rail-link-active" : ""}`}
+            type="button"
+            onClick={() => setSection("explorer")}
+          >
+            <MapIcon size={16} /><span>Route explorer</span>
+          </button>
+          <button
+            className={`rail-link ${section === "saved" ? "rail-link-active" : ""}`}
+            type="button"
+            onClick={() => setSection("saved")}
+          >
+            <Bookmark size={16} /><span>Saved routes</span>
+            {savedRoutes.length > 0 && <span className="rail-link-count">{savedRoutes.length}</span>}
+          </button>
         </nav>
         <div className="rail-footer">
-          <div className="rail-engine-status"><span className="status-dot status-dot-green" /><span><strong>{engine ? "Engine connected" : "Local engine ready"}</strong><small>Prototype environment</small></span></div>
-          <div className="rail-user"><span className="user-avatar">MC</span><span><strong>Maciek C.</strong><small>Explorer</small></span><ChevronDown size={13} /></div>
+          <div className="rail-status">
+            <span className={`status-dot ${elevationStatus === "ready" ? "status-dot-green" : elevationStatus === "loading" ? "status-dot-blue" : "status-dot-orange"}`} />
+            <span>
+              <strong>
+                {elevationStatus === "ready" ? "Elevation loaded" : elevationStatus === "loading" ? "Loading elevation" : "Elevation offline"}
+              </strong>
+              <small>{SOPOCKA_OSM_METADATA.featureCount.toLocaleString()} OSM ways imported</small>
+            </span>
+          </div>
+          <button
+            className="rail-collapse"
+            type="button"
+            onClick={() => setRailCollapsed((collapsed) => !collapsed)}
+            aria-label={railCollapsed ? "Expand navigation" : "Collapse navigation"}
+          >
+            {railCollapsed ? <ChevronsRight size={14} /> : <ChevronsLeft size={14} />}
+            <span>Collapse</span>
+          </button>
         </div>
       </aside>
 
       <div className="app-main">
         <header className="topbar">
           <div className="topbar-left">
-            <button className="mobile-menu-button icon-button" type="button" aria-label="Open navigation"><Menu size={18} /></button>
-            <div className="breadcrumbs"><span>Field operations</span><span className="breadcrumb-separator">/</span><strong>Route explorer</strong></div>
+            <div className="breadcrumbs">
+              <Mountain size={14} />
+              <strong>Sopocka, Gdynia</strong>
+              <span className="breadcrumb-tag">
+                {section === "saved" ? "Saved routes" : "Route explorer"}
+              </span>
+            </div>
           </div>
           <div className="topbar-right">
-            <div className="topbar-search"><Search size={15} /><span>Search routes and datasets</span><kbd>⌘ K</kbd></div>
-            <button className="icon-button" type="button" aria-label="Notifications"><Bell size={16} /></button>
-            <button className="topbar-user" type="button"><span className="user-avatar user-avatar-small">MC</span><ChevronDown size={13} /></button>
+            <span className="topbar-hint">
+              <kbd>S</kbd><kbd>T</kbd><kbd>W</kbd> place points, <kbd>Esc</kbd> to stop
+            </span>
+            <button
+              className="button button-primary button-compact"
+              type="button"
+              onClick={handleSaveRoute}
+              disabled={!view.route}
+            >
+              <Save size={13} /> Save route
+            </button>
           </div>
         </header>
 
-        <div className="workspace-layout" id="map">
-          <ControlsPanel
-            mode={mode}
-            profile={profile}
-            settings={settings}
-            start={start}
-            target={target}
-            waypoints={waypoints}
-            placementMode={placementMode}
-            isCalculating={isCalculating}
-            onModeChange={setMode}
-            onProfileChange={setProfile}
-            onSettingsChange={setSettings}
-            onPlacementModeChange={setPlacementMode}
-            onClearWaypoint={handleClearWaypoint}
-            onReset={handleReset}
-            onRecalculate={() => void recalculate()}
-          />
-          <main className="map-column">
-            <MapCanvas
-              route={route}
+        <div className="workspace-layout">
+          {section === "saved" ? (
+            <SavedRoutes
+              routes={savedRoutes}
+              onRestore={handleRestoreRoute}
+              onDelete={handleDeleteRoute}
+            />
+          ) : (
+            <ControlsPanel
+              mode={mode}
+              profile={profile}
+              settings={settings}
               start={start}
               target={target}
               waypoints={waypoints}
               placementMode={placementMode}
+              isCalculating={isCalculating}
+              onModeChange={setMode}
+              onProfileChange={setProfile}
+              onSettingsChange={setSettings}
+              onPlacementModeChange={setPlacementMode}
+              onClearWaypoint={(index) =>
+                setWaypoints((current) => current.filter((_, position) => position !== index))}
+              onReset={handleReset}
+            />
+          )}
+
+          <main className="map-column">
+            <MapCanvas
+              view={view}
+              mode={mode}
+              start={start}
+              target={target}
+              waypoints={waypoints}
+              placementMode={placementMode}
+              isCalculating={isCalculating}
+              elevationStatus={elevationStatus}
+              elevationGrid={elevation}
+              terrain={terrain}
+              layers={layers}
+              detailsHidden={detailsHidden}
+              hoverPoint={hoverPoint}
+              onLayersChange={setLayers}
               onMapClick={handleMapClick}
               onPlacementModeChange={setPlacementMode}
-              onClearWaypoint={handleClearWaypoint}
-            />
-            <RouteSummary route={route} onDownload={downloadRoute} />
+              onMovePoint={handleMovePoint}
+              onSelectAlternative={handleSelectAlternative}
+            >
+              <RouteSummary
+                view={view}
+                isCalculating={isCalculating}
+                isHidden={detailsHidden}
+                elevationStatus={elevationStatus}
+                hoverIndex={hoverIndex}
+                onHoverIndexChange={setHoverIndex}
+                onHiddenChange={setDetailsHidden}
+                onSelectAlternative={handleSelectAlternative}
+                onDownload={(format) => view.route && downloadRoute(format, view.route, terrain)}
+              />
+            </MapCanvas>
           </main>
         </div>
       </div>

@@ -1,11 +1,11 @@
 /**
- * Stable public entry point for Pathless' terrain-routing core.
+ * Public entry point for the Pathless routing core.
  *
- * A UI can use either the functional `planRoute`/`route` helpers or keep a
- * `TerrainRouter` instance when it wants to reuse a terrain model.
+ * The pieces fit together as: real elevation tiles -> a terrain grid -> the
+ * OSM router, which joins mapped ways with terrain connectors.
  */
 export * from "./types";
+export * from "./geo";
+export * from "./elevation";
 export * from "./terrain";
-export * from "./search";
-export * from "./router";
-
+export * from "./osm-router";

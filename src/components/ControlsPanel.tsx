@@ -1,18 +1,16 @@
 import {
-  ArrowDownUp,
-  Check,
-  ChevronDown,
-  ChevronRight,
+  Bike,
   Compass,
+  CornerUpRight,
   Footprints,
-  Mountain,
+  MoveHorizontal,
   Plus,
+  RotateCcw,
   Route,
-  SlidersHorizontal,
-  Sparkles,
   Target,
-  TreePine,
+  TrendingUp,
   Waves,
+  Wind,
 } from "lucide-react";
 import type { AppMode, MapPoint, PlacementMode, ProfileId, RouteSettings } from "./pathless-types";
 
@@ -28,23 +26,25 @@ type ControlsPanelProps = {
   onModeChange: (mode: AppMode) => void;
   onProfileChange: (profile: ProfileId) => void;
   onSettingsChange: (settings: RouteSettings) => void;
-  onPlacementModeChange: (mode: Exclude<PlacementMode, null>) => void;
+  onPlacementModeChange: (mode: PlacementMode) => void;
   onClearWaypoint: (index: number) => void;
   onReset: () => void;
-  onRecalculate: () => void;
 };
 
-const modeItems: Array<{ id: AppMode; label: string; icon: typeof Route }> = [
-  { id: "nearest", label: "Nearest path", icon: Compass },
-  { id: "destination", label: "Destination", icon: Target },
-  { id: "design", label: "Design route", icon: Route },
+const MODES: Array<{ id: AppMode; label: string; icon: typeof Route; hint: string }> = [
+  { id: "nearest", label: "Nearest path", icon: Compass, hint: "Shortest way from the start to any mapped path" },
+  { id: "destination", label: "Destination", icon: Target, hint: "Route from the start to the target" },
+  { id: "design", label: "Design route", icon: Route, hint: "Route through waypoints in order" },
 ];
 
-const profileItems: Array<{ id: ProfileId; label: string; detail: string; icon: typeof Footprints }> = [
-  { id: "hiker", label: "Hiker", detail: "Steady pace · 4.5 km/h", icon: Footprints },
-  { id: "runner", label: "Trail runner", detail: "Fast pace · 7.2 km/h", icon: Sparkles },
-  { id: "all-terrain", label: "All-terrain", detail: "Mixed surface · 5.1 km/h", icon: Mountain },
+const PROFILES: Array<{ id: ProfileId; label: string; detail: string; icon: typeof Footprints }> = [
+  { id: "hiker", label: "Hiker", detail: "4.6 km/h on level trail", icon: Footprints },
+  { id: "runner", label: "Trail runner", detail: "7.6 km/h on level trail", icon: Wind },
+  { id: "mtb", label: "Mountain bike", detail: "12 km/h on level trail", icon: Bike },
 ];
+
+const formatCoordinate = (point: MapPoint): string =>
+  `${point.lat.toFixed(5)}, ${point.lng.toFixed(5)}`;
 
 type RangeControlProps = {
   label: string;
@@ -54,16 +54,16 @@ type RangeControlProps = {
   step?: number;
   valueLabel: string;
   helpText: string;
+  icon: typeof TrendingUp;
   onChange: (value: number) => void;
 };
 
-function RangeControl({ label, value, min, max, step = 1, valueLabel, helpText, onChange }: RangeControlProps) {
+function RangeControl({ label, value, min, max, step = 1, valueLabel, helpText, icon: Icon, onChange }: RangeControlProps) {
   const progress = ((value - min) / (max - min)) * 100;
-
   return (
     <label className="range-control">
       <span className="range-label-row">
-        <span>{label}</span>
+        <span className="range-label"><Icon size={13} />{label}</span>
         <strong>{valueLabel}</strong>
       </span>
       <input
@@ -104,20 +104,33 @@ function PointRow({
   kind,
   point,
   isActive,
+  disabled = false,
+  shortcut,
   onPick,
 }: {
   kind: "start" | "target";
   point: MapPoint;
   isActive: boolean;
+  disabled?: boolean;
+  shortcut: string;
   onPick: () => void;
 }) {
   const isStart = kind === "start";
   return (
-    <div className="point-row">
+    <div className={`point-row ${isActive ? "point-row-active" : ""}`}>
       <span className={`point-symbol point-symbol-${kind}`}>{isStart ? "A" : "B"}</span>
-      <span className="point-copy"><strong>{isStart ? "Start point" : "Target point"}</strong><small>{point.label ?? (isStart ? "Click to place start" : "Click to place target")}</small></span>
-      <button className={`point-pick-button ${isActive ? "point-pick-button-active" : ""}`} type="button" onClick={onPick}>
-        {isActive ? "Place" : "Pick on map"}
+      <span className="point-copy">
+        <strong>{isStart ? "Start" : "Target"}</strong>
+        <small>{disabled ? "Used in Destination and Design route" : formatCoordinate(point)}</small>
+      </span>
+      <button
+        className={`point-pick-button ${isActive ? "point-pick-button-active" : ""}`}
+        type="button"
+        onClick={onPick}
+        disabled={disabled}
+        title={`Place on the map (${shortcut})`}
+      >
+        {disabled ? "Unused" : isActive ? "Placing" : "Place"}
       </button>
     </div>
   );
@@ -138,18 +151,18 @@ export function ControlsPanel({
   onPlacementModeChange,
   onClearWaypoint,
   onReset,
-  onRecalculate,
 }: ControlsPanelProps) {
-  function patchSettings(next: Partial<RouteSettings>) {
-    onSettingsChange({ ...settings, ...next });
-  }
+  const patch = (next: Partial<RouteSettings>) => onSettingsChange({ ...settings, ...next });
+  const togglePlacement = (next: Exclude<PlacementMode, null>) =>
+    onPlacementModeChange(placementMode === next ? null : next);
+  const activeMode = MODES.find((item) => item.id === mode) ?? MODES[0];
 
   return (
     <aside className="control-panel" aria-label="Route controls">
-      <div className="panel-section panel-section-mode">
-        <div className="section-kicker"><span>Route mode</span><span className="section-index">01</span></div>
+      <div className="panel-section">
+        <div className="section-kicker"><span>Route mode</span></div>
         <div className="mode-tabs" role="tablist" aria-label="Route mode">
-          {modeItems.map(({ id, label, icon: Icon }) => (
+          {MODES.map(({ id, label, icon: Icon }) => (
             <button
               className={`mode-tab ${mode === id ? "mode-tab-active" : ""}`}
               type="button"
@@ -163,85 +176,172 @@ export function ControlsPanel({
             </button>
           ))}
         </div>
+        <p className="section-note">{activeMode.hint}</p>
       </div>
 
-      <div className="panel-section panel-section-points">
-        <div className="section-kicker"><span>Points</span><span className="section-index">02</span></div>
+      <div className="panel-section">
+        <div className="section-kicker">
+          <span>Points</span>
+          <span className="section-aside">{isCalculating ? "Recalculating" : "Live"}</span>
+        </div>
         <div className="points-stack">
-          <PointRow kind="start" point={start} isActive={placementMode === "start"} onPick={() => onPlacementModeChange("start")} />
+          <PointRow
+            kind="start"
+            point={start}
+            shortcut="S"
+            isActive={placementMode === "start"}
+            onPick={() => togglePlacement("start")}
+          />
           <div className="point-connector"><span /></div>
-          <PointRow kind="target" point={target} isActive={placementMode === "target"} onPick={() => onPlacementModeChange("target")} />
+          <PointRow
+            kind="target"
+            point={target}
+            shortcut="T"
+            disabled={mode === "nearest"}
+            isActive={placementMode === "target"}
+            onPick={() => togglePlacement("target")}
+          />
         </div>
         {mode === "design" && (
           <div className="waypoint-list">
-            <div className="waypoint-heading"><span>Waypoints</span><span>{waypoints.length}/5</span></div>
+            <div className="waypoint-heading"><span>Waypoints</span><span>{waypoints.length} of 8</span></div>
             {waypoints.length === 0 ? (
-              <button className="add-waypoint-empty" type="button" onClick={() => onPlacementModeChange("waypoint")}>
-                <Plus size={14} /> Add a waypoint on the map
+              <button
+                className={`add-waypoint-empty ${placementMode === "waypoint" ? "add-waypoint-active" : ""}`}
+                type="button"
+                onClick={() => togglePlacement("waypoint")}
+              >
+                <Plus size={14} />
+                {placementMode === "waypoint" ? "Click the map to add waypoints" : "Add a waypoint on the map"}
               </button>
             ) : (
               <>
                 {waypoints.map((waypoint, index) => (
-                  <div className="waypoint-row" key={`${waypoint.x}-${waypoint.y}-${index}`}>
+                  <div className="waypoint-row" key={`${waypoint.lat}-${waypoint.lng}-${index}`}>
                     <span className="waypoint-number">{index + 1}</span>
-                    <span><strong>{waypoint.label ?? `Waypoint ${index + 1}`}</strong><small>Placed on map</small></span>
+                    <span><strong>Waypoint {index + 1}</strong><small>{formatCoordinate(waypoint)}</small></span>
                     <button type="button" onClick={() => onClearWaypoint(index)} aria-label={`Remove waypoint ${index + 1}`}>×</button>
                   </div>
                 ))}
-                {waypoints.length < 5 && <button className="add-waypoint-button" type="button" onClick={() => onPlacementModeChange("waypoint")}><Plus size={13} /> Add waypoint</button>}
+                {waypoints.length < 8 && (
+                  <button
+                    className={`add-waypoint-button ${placementMode === "waypoint" ? "add-waypoint-active" : ""}`}
+                    type="button"
+                    onClick={() => togglePlacement("waypoint")}
+                  >
+                    <Plus size={13} /> {placementMode === "waypoint" ? "Placing waypoints" : "Add waypoint"}
+                  </button>
+                )}
               </>
             )}
           </div>
         )}
+        <p className="section-note">Drag any marker on the map to move it. Press Esc to stop placing.</p>
       </div>
 
-      <div className="panel-section panel-section-profile">
-        <div className="section-kicker"><span>Travel profile</span><span className="section-index">03</span></div>
-        <div className="profile-select-wrap">
-          <select value={profile} onChange={(event) => onProfileChange(event.target.value as ProfileId)} aria-label="Travel profile">
-            {profileItems.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}
-          </select>
-          <ChevronDown size={15} />
+      <div className="panel-section">
+        <div className="section-kicker"><span>Travel style</span></div>
+        <div className="profile-grid" role="radiogroup" aria-label="Travel style">
+          {PROFILES.map(({ id, label, detail, icon: Icon }) => (
+            <button
+              key={id}
+              type="button"
+              role="radio"
+              aria-checked={profile === id}
+              className={`profile-option ${profile === id ? "profile-option-active" : ""}`}
+              onClick={() => onProfileChange(id)}
+            >
+              <Icon size={15} strokeWidth={1.8} />
+              <strong>{label}</strong>
+              <small>{detail}</small>
+            </button>
+          ))}
         </div>
-        <div className="profile-details">
-          {(() => {
-            const current = profileItems.find((item) => item.id === profile) ?? profileItems[0];
-            const Icon = current.icon;
-            return <><span className="profile-icon"><Icon size={15} /></span><span><strong>{current.label}</strong><small>{current.detail}</small></span><Check size={14} className="profile-check" /></>;
-          })()}
-        </div>
+        <p className="section-note">Speed is adjusted for the real grade and the way&rsquo;s mapped surface.</p>
       </div>
 
-      <div className="panel-section panel-section-terrain">
-        <div className="section-kicker"><span>Terrain preferences</span><span className="section-index">04</span></div>
+      <div className="panel-section">
+        <div className="section-kicker"><span>Limits</span></div>
         <div className="slider-stack">
-          <RangeControl label="Slope tolerance" value={settings.slope} min={10} max={70} valueLabel={`≤ ${settings.slope}%`} helpText="Avoids grades beyond this threshold" onChange={(value) => patchSettings({ slope: value })} />
-          <RangeControl label="Ascent weight" value={settings.ascent} min={0} max={100} valueLabel={settings.ascent < 35 ? "Low" : settings.ascent > 70 ? "High" : "Balanced"} helpText="How strongly elevation affects routing" onChange={(value) => patchSettings({ ascent: value })} />
-          <RangeControl label="Roughness tolerance" value={settings.roughness} min={1} max={5} valueLabel={`${settings.roughness}/5`} helpText="Loose ground, brush and unmapped terrain" onChange={(value) => patchSettings({ roughness: value })} />
-          <RangeControl label="Path preference" value={settings.pathPreference} min={0} max={100} valueLabel={settings.pathPreference < 35 ? "Direct" : settings.pathPreference > 70 ? "Paths" : "Balanced"} helpText="Known paths ↔ shorter line through land" onChange={(value) => patchSettings({ pathPreference: value })} />
-        </div>
-        <div className="toggle-stack">
-          <ToggleRow label="Allow water crossings" detail="Prefer bridges; cross shallow water if needed" checked={settings.allowWater} icon={Waves} onChange={(value) => patchSettings({ allowWater: value })} />
-          <ToggleRow label="Route alternatives" detail="Show two lower-confidence options" checked={settings.alternatives} icon={ArrowDownUp} onChange={(value) => patchSettings({ alternatives: value })} />
+          <RangeControl
+            label="Steepest grade"
+            icon={TrendingUp}
+            value={settings.maxGradePercent}
+            min={5}
+            max={60}
+            valueLabel={`${settings.maxGradePercent}%`}
+            helpText="No part of the route may be steeper than this"
+            onChange={(value) => patch({ maxGradePercent: value })}
+          />
+          <RangeControl
+            label="Longest off-trail stretch"
+            icon={MoveHorizontal}
+            value={settings.maxOffTrailMeters}
+            min={25}
+            max={1_000}
+            step={25}
+            valueLabel={`${settings.maxOffTrailMeters} m`}
+            helpText="Cap on any single stretch away from a mapped way"
+            onChange={(value) => patch({ maxOffTrailMeters: value })}
+          />
+          <RangeControl
+            label="Off-trail effort"
+            icon={CornerUpRight}
+            value={settings.offTrailAversion}
+            min={1}
+            max={5}
+            step={0.5}
+            valueLabel={`${settings.offTrailAversion.toFixed(1)}×`}
+            helpText={settings.offTrailAversion <= 1
+              ? "A minute in the open is worth a minute on a trail"
+              : `A minute in the open costs like ${settings.offTrailAversion.toFixed(1)} on a trail`}
+            onChange={(value) => patch({ offTrailAversion: value })}
+          />
         </div>
       </div>
 
-      <div className="panel-section panel-section-legend">
-        <div className="section-kicker"><span>Source & confidence</span><span className="section-index">05</span></div>
-        <div className="legend-row"><span className="legend-line legend-line-blue" /><span>Mapped trail network</span><span className="legend-confidence">High</span></div>
-        <div className="legend-row"><span className="legend-line legend-line-green" /><span>Terrain inference</span><span className="legend-confidence">Medium</span></div>
-        <div className="legend-row"><span className="legend-line legend-line-orange" /><span>Unmapped / seasonal</span><span className="legend-confidence">Review</span></div>
+      <div className="panel-section">
+        <div className="section-kicker"><span>What is allowed</span></div>
+        <div className="toggle-stack">
+          <ToggleRow
+            label="Cross streets anywhere"
+            detail="Off: only cross where OSM maps a crossing"
+            checked={settings.allowStreetCrossing}
+            icon={CornerUpRight}
+            onChange={(value) => patch({ allowStreetCrossing: value })}
+          />
+          <ToggleRow
+            label="Walk along streets"
+            detail="Off unless a sidewalk or footway is mapped"
+            checked={settings.allowStreetWalking}
+            icon={Footprints}
+            onChange={(value) => patch({ allowStreetWalking: value })}
+          />
+          <ToggleRow
+            label="Avoid watercourses"
+            detail="Refuse ground within 26 m of a mapped stream"
+            checked={settings.avoidWater}
+            icon={Waves}
+            onChange={(value) => patch({ avoidWater: value })}
+          />
+          <ToggleRow
+            label="Offer alternatives"
+            detail="Draw a direct and a trail-hugging option too"
+            checked={settings.showAlternatives}
+            icon={Route}
+            onChange={(value) => patch({ showAlternatives: value })}
+          />
+        </div>
       </div>
 
       <div className="panel-actions">
-        <button className="button button-ghost" type="button" onClick={onReset}><SlidersHorizontal size={14} /> Reset</button>
-        <button className="button button-primary" type="button" onClick={onRecalculate} disabled={isCalculating}>
-          {isCalculating ? <span className="button-spinner" /> : <TreePine size={14} />}
-          {isCalculating ? "Calculating" : "Recalculate route"}
-          {!isCalculating && <ChevronRight size={14} />}
+        <button className="button button-ghost" type="button" onClick={onReset}>
+          <RotateCcw size={13} /> Reset
         </button>
+        <span className="panel-actions-note">
+          {isCalculating ? "Recalculating" : "Routes update as you change anything"}
+        </span>
       </div>
     </aside>
   );
 }
-
