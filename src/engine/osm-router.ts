@@ -488,6 +488,109 @@ class MinHeap {
   }
 }
 
+type CellSearchScratch = {
+  costs: Float64Array;
+  lengths: Float64Array;
+  priorities: Float64Array;
+  previous: Int32Array;
+  stamp: Int32Array;
+  generation: number;
+};
+
+class CellHeap {
+  private nodes = new Int32Array(256);
+  private priorities = new Float64Array(256);
+  private sizeValue = 0;
+  private poppedPriorityValue = Number.POSITIVE_INFINITY;
+
+  get size(): number {
+    return this.sizeValue;
+  }
+
+  get poppedPriority(): number {
+    return this.poppedPriorityValue;
+  }
+
+  clear(): void {
+    this.sizeValue = 0;
+  }
+
+  push(node: number, priority: number): void {
+    if (this.sizeValue === this.nodes.length) this.grow();
+    let index = this.sizeValue;
+    this.nodes[index] = node;
+    this.priorities[index] = priority;
+    this.sizeValue += 1;
+    while (index > 0) {
+      const parent = (index - 1) >>> 1;
+      if (this.priorities[parent] <= this.priorities[index]) break;
+      const nodeValue = this.nodes[parent];
+      this.nodes[parent] = this.nodes[index];
+      this.nodes[index] = nodeValue;
+      const priorityValue = this.priorities[parent];
+      this.priorities[parent] = this.priorities[index];
+      this.priorities[index] = priorityValue;
+      index = parent;
+    }
+  }
+
+  pop(): number {
+    if (this.sizeValue === 0) return -1;
+    const node = this.nodes[0];
+    this.poppedPriorityValue = this.priorities[0];
+    this.sizeValue -= 1;
+    if (this.sizeValue > 0) {
+      this.nodes[0] = this.nodes[this.sizeValue];
+      this.priorities[0] = this.priorities[this.sizeValue];
+      let index = 0;
+      while (true) {
+        const left = (index << 1) + 1;
+        const right = left + 1;
+        let smallest = index;
+        if (left < this.sizeValue && this.priorities[left] < this.priorities[smallest]) smallest = left;
+        if (right < this.sizeValue && this.priorities[right] < this.priorities[smallest]) smallest = right;
+        if (smallest === index) break;
+        const nodeValue = this.nodes[index];
+        this.nodes[index] = this.nodes[smallest];
+        this.nodes[smallest] = nodeValue;
+        const priorityValue = this.priorities[index];
+        this.priorities[index] = this.priorities[smallest];
+        this.priorities[smallest] = priorityValue;
+        index = smallest;
+      }
+    }
+    return node;
+  }
+
+  private grow(): void {
+    const nextSize = this.nodes.length * 2;
+    const nextNodes = new Int32Array(nextSize);
+    const nextPriorities = new Float64Array(nextSize);
+    nextNodes.set(this.nodes);
+    nextPriorities.set(this.priorities);
+    this.nodes = nextNodes;
+    this.priorities = nextPriorities;
+  }
+}
+
+let terrainCellSearchScratch: CellSearchScratch | undefined;
+const cellSearchScratch = (cellCount: number): CellSearchScratch => {
+  if (!terrainCellSearchScratch || terrainCellSearchScratch.costs.length !== cellCount) {
+    terrainCellSearchScratch = {
+      costs: new Float64Array(cellCount),
+      lengths: new Float64Array(cellCount),
+      priorities: new Float64Array(cellCount),
+      previous: new Int32Array(cellCount),
+      stamp: new Int32Array(cellCount),
+      generation: 0,
+    };
+  }
+  terrainCellSearchScratch.generation += 1;
+  return terrainCellSearchScratch;
+};
+
+const terrainCellHeap = new CellHeap();
+
 /** Nearest graph nodes, searched outward through the spatial index. */
 const nearestNodeIds = (
   graph: Graph,
@@ -781,27 +884,30 @@ const terrainConnectorPath = (
   }
 
   const cellCount = terrain.rows * terrain.columns;
-  const costs = new Float64Array(cellCount).fill(Number.POSITIVE_INFINITY);
-  const lengths = new Float64Array(cellCount).fill(Number.POSITIVE_INFINITY);
-  const priorities = new Float64Array(cellCount).fill(Number.POSITIVE_INFINITY);
-  const previous = new Int32Array(cellCount).fill(-1);
-  const heap = new MinHeap();
+  const scratch = cellSearchScratch(cellCount);
+  const { costs, lengths, priorities, previous, stamp } = scratch;
+  const generation = scratch.generation;
+  terrainCellHeap.clear();
   costs[startId] = 0;
   lengths[startId] = 0;
   priorities[startId] = 0;
-  heap.push({ node: startId, cost: 0 });
+  previous[startId] = -1;
+  stamp[startId] = generation;
+  terrainCellHeap.push(startId, 0);
   const directions = [
     [-1, 0], [1, 0], [0, -1], [0, 1],
     [-1, -1], [-1, 1], [1, -1], [1, 1],
   ] as const;
   const fastest = speedMetersPerMinute(input.profile, -0.05, "open-terrain");
+  const goalSlack = distanceBetweenCoordinates(to, goal.coordinate);
 
-  while (heap.length > 0) {
-    const current = heap.pop();
-    if (!current || current.cost !== priorities[current.node]) continue;
-    if (current.node === goalId) break;
-    const row = Math.floor(current.node / terrain.columns);
-    const column = current.node % terrain.columns;
+  while (terrainCellHeap.size > 0) {
+    const currentNode = terrainCellHeap.pop();
+    if (currentNode < 0) continue;
+    if (stamp[currentNode] !== generation || terrainCellHeap.poppedPriority !== priorities[currentNode]) continue;
+    if (currentNode === goalId) break;
+    const row = Math.floor(currentNode / terrain.columns);
+    const column = currentNode % terrain.columns;
     const currentCell = terrain.cellAt(row, column);
     if (!currentCell) continue;
 
@@ -818,20 +924,28 @@ const terrainConnectorPath = (
         "open-terrain",
       );
       if (!profileAllowed(profile, input)) continue;
-      const nextLength = lengths[current.node] + profile.distanceMeters;
+      const nextLength = lengths[currentNode] + profile.distanceMeters;
       if (nextLength > budget) continue;
-      const nextCost = costs[current.node] + connectorStepCost(profile, input, flavor);
-      if (nextCost >= costs[nextId]) continue;
+      // The rest of the path can never be shorter than the straight line to the
+      // goal, so anything already over budget by that measure is unreachable —
+      // this prunes the frontier without discarding a cell a valid path could
+      // have used. The slack is because the search ends at the goal *cell*
+      // while the path ends at `to` somewhere inside it.
+      if (nextLength + distanceBetweenCoordinates(nextCell.coordinate, goal.coordinate) >
+          budget + goalSlack) continue;
+      const nextCost = costs[currentNode] + connectorStepCost(profile, input, flavor);
+      if (stamp[nextId] === generation && nextCost >= costs[nextId]) continue;
       costs[nextId] = nextCost;
       lengths[nextId] = nextLength;
-      previous[nextId] = current.node;
+      previous[nextId] = currentNode;
       priorities[nextId] = nextCost +
         distanceBetweenCoordinates(nextCell.coordinate, goal.coordinate) / fastest;
-      heap.push({ node: nextId, cost: priorities[nextId] });
+      stamp[nextId] = generation;
+      terrainCellHeap.push(nextId, priorities[nextId]);
     }
   }
 
-  if (!Number.isFinite(costs[goalId])) return undefined;
+  if (stamp[goalId] !== generation) return undefined;
   const cells: TerrainCell[] = [];
   let cursor = goalId;
   while (cursor >= 0) {
