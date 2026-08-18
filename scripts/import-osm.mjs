@@ -1,3 +1,15 @@
+/**
+ * Bakes the OpenStreetMap snapshot the router reads from an Overpass response.
+ *
+ * Fetch the response first, then run this over it:
+ *
+ *   curl -X POST -d @scripts/sopocka.overpass \
+ *     https://overpass-api.de/api/interpreter -o /tmp/pathless-sopocka-map.json
+ *   node scripts/import-osm.mjs
+ *
+ * The query lives in scripts/sopocka.overpass so the snapshot can actually be
+ * reproduced; it used to exist only in whoever ran it last.
+ */
 import { readFile, writeFile } from "node:fs/promises";
 
 const input = process.argv[2] ?? "/tmp/pathless-sopocka-map.json";
@@ -22,6 +34,55 @@ const supportedPaths = new Set([
   "pedestrian",
   "steps",
 ]);
+/**
+ * Barriers that actually stop someone on foot.
+ *
+ * Deliberately narrower than `barrier=*`: a guard rail or a bollard is there to
+ * stop a vehicle and a walker steps past it, and a ditch is an obstacle but not
+ * a closure. Those are all still imported and tagged, so the router can decide
+ * later; only these are treated as something you cannot walk through.
+ */
+const blockingBarriers = new Set([
+  "fence",
+  "wall",
+  "retaining_wall",
+  "hedge",
+  "city_wall",
+]);
+/** Nodes that mark a way through a barrier rather than a point on it. */
+const barrierOpenings = new Set([
+  "gate",
+  "lift_gate",
+  "swing_gate",
+  "kissing_gate",
+  "stile",
+  "turnstile",
+  "cattle_grid",
+  "entrance",
+]);
+
+/**
+ * Whether this barrier closes the line to someone on foot. An explicit foot or
+ * access tag saying otherwise wins: a fence tagged `foot=yes` is a fence with a
+ * way through it that someone has already recorded.
+ */
+const blocksOnFoot = (tags) => {
+  if (!blockingBarriers.has(tags.barrier)) return false;
+  const foot = (tags.foot ?? "").trim().toLowerCase();
+  if (["yes", "designated", "permissive", "destination"].includes(foot)) return false;
+  const access = (tags.access ?? "").trim().toLowerCase();
+  return !["yes", "permissive", "destination"].includes(access);
+};
+
+/** Gate nodes, so a crossing can be allowed where OSM records a way through. */
+const openings = source.elements.flatMap((element) => {
+  if (element.type !== "node" || !barrierOpenings.has(element.tags?.barrier)) return [];
+  const access = (element.tags.access ?? "").trim().toLowerCase();
+  const locked = (element.tags.locked ?? "").trim().toLowerCase();
+  // A gate nobody may use is not an opening.
+  if (["private", "no"].includes(access) || locked === "yes") return [];
+  return [[element.lat, element.lon]];
+});
 
 const features = source.elements.flatMap((element) => {
   if (element.type !== "way" || !Array.isArray(element.geometry) || element.geometry.length < 2) {
@@ -36,7 +97,9 @@ const features = source.elements.flatMap((element) => {
       ? "road"
       : tags.waterway || tags.natural === "water"
         ? "water"
-        : null;
+        : tags.barrier
+          ? "barrier"
+          : null;
   if (!category) return [];
 
   return [{
@@ -63,12 +126,13 @@ const features = source.elements.flatMap((element) => {
     tracktype: tags.tracktype,
     trailVisibility: tags.trail_visibility,
     waterway: tags.waterway,
+    blocksOnFoot: category === "barrier" ? blocksOnFoot(tags) : undefined,
     coordinates: element.geometry.map(({ lat, lon }) => [lat, lon]),
   }];
 });
 
 const outputData = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   source: "OpenStreetMap",
   sourceUrl: "https://www.openstreetmap.org/",
   overpassUrl: "https://overpass-api.de/api/interpreter",
@@ -82,7 +146,13 @@ const outputData = {
     west: 18.480,
   },
   features,
+  barrierOpenings: openings,
 };
 
 await writeFile(output, `${JSON.stringify(outputData)}\n`);
-console.log(`Imported ${features.length} OSM ways into ${output}`);
+console.log(
+  `Imported ${features.length} OSM ways ` +
+  `(${features.filter((feature) => feature.category === "barrier").length} barriers, ` +
+  `${features.filter((feature) => feature.blocksOnFoot).length} of them closed on foot) ` +
+  `and ${openings.length} openings into ${output}`,
+);

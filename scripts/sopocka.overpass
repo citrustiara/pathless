@@ -1,0 +1,16 @@
+/*
+ * Everything the router reads, for the Sopocka working area.
+ * Run with:
+ *   curl -X POST -d @scripts/sopocka.overpass \
+ *     https://overpass-api.de/api/interpreter -o /tmp/pathless-sopocka-map.json
+ * then: node scripts/import-osm.mjs
+ */
+[out:json][timeout:180];
+(
+  way["highway"](54.445,18.480,54.470,18.535);
+  way["waterway"](54.445,18.480,54.470,18.535);
+  way["natural"="water"](54.445,18.480,54.470,18.535);
+  way["barrier"](54.445,18.480,54.470,18.535);
+  node["barrier"](54.445,18.480,54.470,18.535);
+);
+out geom;

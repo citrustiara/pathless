@@ -16,6 +16,7 @@ import {
   type GeoBounds,
   type OSMRoutingRequest,
 } from "./index";
+import { SOPOCKA_BARRIERS, SOPOCKA_BARRIER_OPENINGS } from "../data/sopocka";
 
 const BOUNDS: GeoBounds = { north: 54.47, south: 54.445, east: 18.535, west: 18.48 };
 
@@ -364,6 +365,76 @@ describe("OSM router", () => {
       ...result.routes[0].coordinates.map((point) => distanceBetweenCoordinates(point, waypoint)),
     );
     expect(nearest).toBeLessThan(30);
+  });
+});
+
+describe("mapped barriers", () => {
+  /** Where two segments cross, or undefined. Planar is fine over a few hundred metres. */
+  const crossingPoint = (
+    a: Coordinate, b: Coordinate, c: Coordinate, d: Coordinate,
+  ): Coordinate | undefined => {
+    const scale = Math.cos((54.4575 * Math.PI) / 180);
+    const [x1, y1] = [a.lng * scale, a.lat];
+    const [x2, y2] = [b.lng * scale, b.lat];
+    const [x3, y3] = [c.lng * scale, c.lat];
+    const [x4, y4] = [d.lng * scale, d.lat];
+    const denominator = (x2 - x1) * (y4 - y3) - (y2 - y1) * (x4 - x3);
+    if (Math.abs(denominator) < 1e-14) return undefined;
+    const t = ((x3 - x1) * (y4 - y3) - (y3 - y1) * (x4 - x3)) / denominator;
+    const u = ((x3 - x1) * (y2 - y1) - (y3 - y1) * (x2 - x1)) / denominator;
+    if (t < 0 || t > 1 || u < 0 || u > 1) return undefined;
+    return { lat: y1 + t * (y2 - y1), lng: (x1 + t * (x2 - x1)) / scale };
+  };
+
+  it("imports the walls and fences that close a line on foot", () => {
+    expect(SOPOCKA_BARRIERS.length).toBeGreaterThan(100);
+    // Guard rails, bollards and ditches stop a vehicle, not a walker, so they
+    // are imported but must never reach the blocking set.
+    expect(SOPOCKA_BARRIERS.every((barrier) =>
+      !["guard_rail", "bollard", "ditch", "kerb"].includes(barrier.barrier ?? ""))).toBe(true);
+    expect(SOPOCKA_BARRIER_OPENINGS.length).toBeGreaterThan(10);
+  });
+
+  it("never draws an off-trail line through a fence except at a mapped opening", () => {
+    // Sampled across the whole area rather than one hand-picked pair, because a
+    // single route can miss every fence by luck. Remove the barrier rule and
+    // this same sweep walks through a mapped fence six times, so it is the rule
+    // being tested here and not the sample.
+    const terrain = terrainFor();
+    let seed = 12345;
+    const random = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+    const violations: Coordinate[] = [];
+    let offTrailSegments = 0;
+
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const origin = { lat: 54.447 + random() * 0.022, lng: 18.483 + random() * 0.049 };
+      const destination = { lat: 54.447 + random() * 0.022, lng: 18.483 + random() * 0.049 };
+      const route = planOSMRoute({
+        ...baseRequest, origin, destination, offTrailAversion: 1, maxOffTrailMeters: 400,
+      }, terrain).routes[0];
+      if (!route) continue;
+
+      for (const segment of route.segments) {
+        if (segment.mappedPath || segment.distanceMeters < 0.5) continue;
+        offTrailSegments += 1;
+        for (const barrier of SOPOCKA_BARRIERS) {
+          for (let index = 1; index < barrier.coordinates.length; index += 1) {
+            const point = crossingPoint(
+              segment.from, segment.to,
+              { lat: barrier.coordinates[index - 1][0], lng: barrier.coordinates[index - 1][1] },
+              { lat: barrier.coordinates[index][0], lng: barrier.coordinates[index][1] },
+            );
+            if (!point) continue;
+            const throughAnOpening = SOPOCKA_BARRIER_OPENINGS
+              .some((opening) => distanceBetweenCoordinates(point, opening) <= 12);
+            if (!throughAnOpening) violations.push(point);
+          }
+        }
+      }
+    }
+
+    expect(offTrailSegments).toBeGreaterThan(50);
+    expect(violations).toEqual([]);
   });
 });
 

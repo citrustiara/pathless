@@ -15,7 +15,12 @@ import {
   segmentsParallel,
 } from "./geo";
 import type { ActivityProfile, Coordinate, TerrainCell, TerrainModel } from "./types";
-import { SOPOCKA_OSM_WAYS, type OSMFeature } from "../data/sopocka";
+import {
+  SOPOCKA_BARRIER_OPENINGS,
+  SOPOCKA_BARRIERS,
+  SOPOCKA_OSM_WAYS,
+  type OSMFeature,
+} from "../data/sopocka";
 
 export type OSMRouteMode = "nearest" | "destination" | "design";
 
@@ -130,8 +135,12 @@ type Graph = {
   nodeIndex: Map<number, number[]>;
   roadSegments: RoadSegment[];
   roadIndex: Map<number, RoadSegment[]>;
+  barrierSegments: RoadSegment[];
+  barrierIndex: Map<number, RoadSegment[]>;
   crossingPoints: Coordinate[];
   crossingIndex: Map<number, Coordinate[]>;
+  barrierOpenings: Coordinate[];
+  openingIndex: Map<number, Coordinate[]>;
 };
 
 type SearchPath = {
@@ -164,6 +173,10 @@ const MAX_NEAREST_PATH_NODES = 64;
 const SAMPLE_SPACING_METERS = 4;
 const SPATIAL_BUCKET_DEGREES = 0.001;
 const ROAD_CROSSING_TOLERANCE_METERS = 24;
+/** A gate is a specific point, not a stretch, so this is tighter than road crossing.
+ * 12 m is a little over two cells of the 5 m routing grid.
+ */
+const BARRIER_OPENING_TOLERANCE_METERS = 12;
 
 /**
  * How far a single off-trail step may reach, in cells.
@@ -417,6 +430,22 @@ const roadCandidatesForLine = (
   return [...candidates];
 };
 
+const barrierCandidatesForLine = (
+  graph: Graph,
+  from: Coordinate,
+  to: Coordinate,
+): RoadSegment[] | undefined => {
+  let candidates: Set<RoadSegment> | undefined;
+  segmentBounds(from, to, 0.00015, (key) => {
+    const bucketSegments = graph.barrierIndex.get(key);
+    if (!bucketSegments || bucketSegments.length === 0) return;
+    if (!candidates) candidates = new Set<RoadSegment>();
+    for (const segment of bucketSegments) candidates.add(segment);
+  });
+  if (!candidates) return undefined;
+  return [...candidates];
+};
+
 const crossingCandidatesNear = (graph: Graph, point: Coordinate): Coordinate[] => {
   const candidates = new Set<Coordinate>();
   bucketKeysForBounds(
@@ -426,6 +455,20 @@ const crossingCandidatesNear = (graph: Graph, point: Coordinate): Coordinate[] =
     point.lng + 0.0004,
     (key) => {
     for (const crossing of graph.crossingIndex.get(key) ?? []) candidates.add(crossing);
+    },
+  );
+  return [...candidates];
+};
+
+const openingCandidatesNear = (graph: Graph, point: Coordinate): Coordinate[] => {
+  const candidates = new Set<Coordinate>();
+  bucketKeysForBounds(
+    point.lat - 0.0004,
+    point.lat + 0.0004,
+    point.lng - 0.0004,
+    point.lng + 0.0004,
+    (key) => {
+      for (const opening of graph.openingIndex.get(key) ?? []) candidates.add(opening);
     },
   );
   return [...candidates];
@@ -464,7 +507,11 @@ const deriveCrossingPoints = (
   return points;
 };
 
-const buildGraph = (features: readonly OSMFeature[]): Graph => {
+const buildGraph = (
+  features: readonly OSMFeature[],
+  barriers: readonly OSMFeature[],
+  openings: readonly Coordinate[],
+): Graph => {
   const graph: Graph = {
     nodes: [],
     nodeByKey: new Map(),
@@ -473,6 +520,10 @@ const buildGraph = (features: readonly OSMFeature[]): Graph => {
     roadIndex: new Map(),
     crossingPoints: [],
     crossingIndex: new Map(),
+    barrierSegments: [],
+    barrierIndex: new Map(),
+    barrierOpenings: [],
+    openingIndex: new Map(),
   };
   const pathSegments: RoadSegment[] = [];
 
@@ -514,10 +565,28 @@ const buildGraph = (features: readonly OSMFeature[]): Graph => {
   graph.roadIndex = buildSegmentIndex(graph.roadSegments);
   graph.crossingPoints = deriveCrossingPoints(pathSegments, graph.roadIndex);
   graph.crossingIndex = buildPointIndex(graph.crossingPoints);
+  for (const feature of barriers) {
+    for (let index = 1; index < feature.coordinates.length; index += 1) {
+      graph.barrierSegments.push({
+        from: {
+          lat: feature.coordinates[index - 1][0],
+          lng: feature.coordinates[index - 1][1],
+        },
+        to: {
+          lat: feature.coordinates[index][0],
+          lng: feature.coordinates[index][1],
+        },
+        feature,
+      });
+    }
+  }
+  graph.barrierIndex = buildSegmentIndex(graph.barrierSegments);
+  graph.barrierOpenings = [...openings];
+  graph.openingIndex = buildPointIndex(graph.barrierOpenings);
   return graph;
 };
 
-const SOPOCKA_GRAPH = buildGraph(SOPOCKA_OSM_WAYS);
+const SOPOCKA_GRAPH = buildGraph(SOPOCKA_OSM_WAYS, SOPOCKA_BARRIERS, SOPOCKA_BARRIER_OPENINGS);
 
 class MinHeap {
   private readonly values: Array<{ node: number; cost: number }> = [];
@@ -825,9 +894,20 @@ const nearMappedCrossing = (graph: Graph, point: Coordinate): boolean =>
   crossingCandidatesNear(graph, point)
     .some((crossing) => distanceBetweenCoordinates(point, crossing) <= ROAD_CROSSING_TOLERANCE_METERS);
 
+const nearBarrierOpening = (graph: Graph, point: Coordinate): boolean =>
+  openingCandidatesNear(graph, point)
+    .some((opening) => distanceBetweenCoordinates(point, opening) <= BARRIER_OPENING_TOLERANCE_METERS);
+
 /**
- * Guard an off-network segment against the street layer, so a connector cannot
- * silently cut across a road or run along a carriageway.
+ * Guard an off-network segment against the street and barrier layers, so a
+ * connector cannot silently cut across a road, run along a carriageway, or walk
+ * through a mapped wall or fence.
+ *
+ * The barrier rule has no request flag: a wall is a wall. It is also checked
+ * here only, never on a mapped way's own edges — a mapped path is positive
+ * evidence that people do go that way, and where a path meets a fence there is
+ * nearly always a gate whether or not anyone has mapped the node. Refusing
+ * those would discard real routes to enforce a rule about invented ones.
  */
 const terrainSegmentAllowed = (
   from: Coordinate,
@@ -837,23 +917,33 @@ const terrainSegmentAllowed = (
 ): boolean => {
   const length = distanceBetweenCoordinates(from, to);
   const roadCandidates = roadCandidatesForLine(graph, from, to);
-  if (!roadCandidates) return true;
-  for (const road of roadCandidates) {
-    const intersection = segmentIntersection(from, to, road.from, road.to);
-    if (!intersection) continue;
-    // No "near this segment's own endpoint" exemption here: this same check
-    // runs on every single hop of the off-trail grid search, so a blanket
-    // endpoint exemption let a multi-hop path slip across an untagged road
-    // piecemeal, one short hop at a time, without ever tripping the rule.
-    if (!input.allowStreetCrossing && !nearMappedCrossing(graph, intersection)) {
-      return false;
-    }
+  if (roadCandidates) {
+    for (const road of roadCandidates) {
+      const intersection = segmentIntersection(from, to, road.from, road.to);
+      if (!intersection) continue;
+      // No "near this segment's own endpoint" exemption here: this same check
+      // runs on every single hop of the off-trail grid search, so a blanket
+      // endpoint exemption let a multi-hop path slip across an untagged road
+      // piecemeal, one short hop at a time, without ever tripping the rule.
+      if (!input.allowStreetCrossing && !nearMappedCrossing(graph, intersection)) {
+        return false;
+      }
 
-    if (!input.allowStreetWalking && !hasWalkwayEvidence(road.feature) && length > 18 &&
-        pointDistanceToSegment(from, road.from, road.to) <= 14 &&
-        pointDistanceToSegment(to, road.from, road.to) <= 14 &&
-        pointDistanceToSegment(interpolateCoordinate(from, to, 0.5), road.from, road.to) <= 14 &&
-        segmentsParallel(from, to, road.from, road.to)) {
+      if (!input.allowStreetWalking && !hasWalkwayEvidence(road.feature) && length > 18 &&
+          pointDistanceToSegment(from, road.from, road.to) <= 14 &&
+          pointDistanceToSegment(to, road.from, road.to) <= 14 &&
+          pointDistanceToSegment(interpolateCoordinate(from, to, 0.5), road.from, road.to) <= 14 &&
+          segmentsParallel(from, to, road.from, road.to)) {
+        return false;
+      }
+    }
+  }
+  const barrierCandidates = barrierCandidatesForLine(graph, from, to);
+  if (!barrierCandidates) return true;
+  for (const barrier of barrierCandidates) {
+    const intersection = segmentIntersection(from, to, barrier.from, barrier.to);
+    if (!intersection) continue;
+    if (!nearBarrierOpening(graph, intersection)) {
       return false;
     }
   }
@@ -1483,4 +1573,6 @@ export const osmGraphStats = {
   nodes: SOPOCKA_GRAPH.nodes.length,
   directedEdges: SOPOCKA_GRAPH.nodes.reduce((total, node) => total + node.edges.length, 0),
   mappedCrossings: SOPOCKA_GRAPH.crossingPoints.length,
+  barrierSegments: SOPOCKA_GRAPH.barrierSegments.length,
+  barrierOpenings: SOPOCKA_GRAPH.barrierOpenings.length,
 };
