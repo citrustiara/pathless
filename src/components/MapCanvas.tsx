@@ -44,6 +44,7 @@ type MapCanvasProps = {
   onPlacementModeChange: (mode: PlacementMode) => void;
   onMovePoint: (kind: "start" | "target" | "waypoint", index: number, point: MapPoint) => void;
   onAddWaypoint: (point: MapPoint) => void;
+  onRemoveWaypoint: (index: number) => void;
   onSelectAlternative: (index: number) => void;
   children?: ReactNode;
 };
@@ -325,6 +326,7 @@ export function MapCanvas({
   onPlacementModeChange,
   onMovePoint,
   onAddWaypoint,
+  onRemoveWaypoint,
   onSelectAlternative,
   children,
 }: MapCanvasProps) {
@@ -460,9 +462,16 @@ export function MapCanvas({
                 const { lat, lng } = event.target.getLatLng();
                 onMovePoint("waypoint", index, { lat, lng });
               },
+              contextmenu: (event) => {
+                event.originalEvent.preventDefault();
+                event.originalEvent.stopPropagation();
+                onRemoveWaypoint(index);
+              },
             }}
           >
-            <Tooltip direction="top" offset={[0, -12]}>Waypoint {index + 1}. Drag to move.</Tooltip>
+            <Tooltip direction="top" offset={[0, -12]}>
+              Waypoint {index + 1}. Drag to move, right-click to remove.
+            </Tooltip>
           </Marker>
         ))}
 

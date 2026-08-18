@@ -370,6 +370,10 @@ export function App() {
     setWaypoints((current) => (current.length < MAX_WAYPOINTS ? [...current, point] : current));
   }, []);
 
+  const handleRemoveWaypoint = useCallback((index: number) => {
+    setWaypoints((current) => current.filter((_, position) => position !== index));
+  }, []);
+
   const handleSwapEnds = useCallback(() => {
     setStart(target);
     setTarget(start);
@@ -528,8 +532,7 @@ export function App() {
               onProfileChange={handleProfileChange}
               onSettingsChange={setSettings}
               onPlacementModeChange={setPlacementMode}
-              onClearWaypoint={(index) =>
-                setWaypoints((current) => current.filter((_, position) => position !== index))}
+              onClearWaypoint={handleRemoveWaypoint}
               onSwapEnds={handleSwapEnds}
               onReset={handleReset}
             />
@@ -555,6 +558,7 @@ export function App() {
               onPlacementModeChange={setPlacementMode}
               onMovePoint={handleMovePoint}
               onAddWaypoint={handleAddWaypoint}
+              onRemoveWaypoint={handleRemoveWaypoint}
               onSelectAlternative={handleSelectAlternative}
             >
               <RouteSummary
