@@ -331,11 +331,19 @@ const buildPointIndex = (points: Coordinate[]): Map<string, Coordinate[]> => {
   return index;
 };
 
-const roadCandidatesForLine = (graph: Graph, from: Coordinate, to: Coordinate): RoadSegment[] => {
-  const candidates = new Set<RoadSegment>();
+const roadCandidatesForLine = (
+  graph: Graph,
+  from: Coordinate,
+  to: Coordinate,
+): RoadSegment[] | undefined => {
+  let candidates: Set<RoadSegment> | undefined;
   for (const key of segmentBounds(from, to, 0.00015)) {
-    for (const segment of graph.roadIndex.get(key) ?? []) candidates.add(segment);
+    const bucketSegments = graph.roadIndex.get(key);
+    if (!bucketSegments || bucketSegments.length === 0) continue;
+    if (!candidates) candidates = new Set<RoadSegment>();
+    for (const segment of bucketSegments) candidates.add(segment);
   }
+  if (!candidates) return undefined;
   return [...candidates];
 };
 
@@ -532,31 +540,29 @@ const speedMetersPerMinute = (
 const maxGradeFor = (input: OSMRoutingRequest): number =>
   Math.max(0.02, input.maxGradePercent / 100);
 
-const sampledCoordinates = (coordinates: readonly Coordinate[]): Coordinate[] => {
-  if (coordinates.length < 2) return [...coordinates];
-  const samples: Coordinate[] = [coordinates[0]];
-  for (let index = 1; index < coordinates.length; index += 1) {
-    const from = coordinates[index - 1];
-    const to = coordinates[index];
-    const count = Math.max(1, Math.ceil(distanceBetweenCoordinates(from, to) / SAMPLE_SPACING_METERS));
-    for (let sample = 1; sample <= count; sample += 1) {
-      samples.push(interpolateCoordinate(from, to, sample / count));
-    }
-  }
-  return samples;
-};
-
 const terrainFor = (terrain: TerrainModel, coordinate: Coordinate): TerrainCell =>
   terrain.cellAtCoordinate(coordinate);
 
-/** Walk a polyline and accumulate real distance, climb, grade, and time. */
-const pathProfile = (
-  coordinates: readonly Coordinate[],
+const segmentProfileScratchFrom: Coordinate = { lat: 0, lng: 0 };
+const segmentProfileScratchTo: Coordinate = { lat: 0, lng: 0 };
+
+/**
+ * Walk one segment and accumulate real distance, climb, grade, and time.
+ *
+ * The grid search evaluates this hundreds of thousands of times per request, so
+ * it samples through two module-level scratch coordinates rather than
+ * allocating one object per sample. That is safe only because the terrain model
+ * reads a coordinate's fields and never retains it — and it means this function
+ * must never be called reentrantly.
+ */
+const segmentProfile = (
+  from: Coordinate,
+  to: Coordinate,
   terrain: TerrainModel,
   profile: ActivityProfile,
   surface: SurfaceClass,
 ): PathProfile => {
-  const samples = sampledCoordinates(coordinates);
+  const count = Math.max(1, Math.ceil(distanceBetweenCoordinates(from, to) / SAMPLE_SPACING_METERS));
   let distanceMeters = 0;
   let elevationChangeMeters = 0;
   let ascentMeters = 0;
@@ -565,15 +571,24 @@ const pathProfile = (
   let timeMinutes = 0;
   let waterRisk = 0;
   let sideSlopeDegrees = 0;
+  const deltaLat = to.lat - from.lat;
+  const deltaLng = to.lng - from.lng;
+  const currentSample = segmentProfileScratchFrom;
+  const nextSample = segmentProfileScratchTo;
+  currentSample.lat = from.lat;
+  currentSample.lng = from.lng;
+  let previousElevation = terrain.elevationAt(currentSample);
 
-  for (let index = 1; index < samples.length; index += 1) {
-    const from = samples[index - 1];
-    const to = samples[index];
-    const segmentDistance = distanceBetweenCoordinates(from, to);
+  for (let sample = 1; sample <= count; sample += 1) {
+    const fraction = sample / count;
+    nextSample.lat = from.lat + deltaLat * fraction;
+    nextSample.lng = from.lng + deltaLng * fraction;
+    const segmentDistance = distanceBetweenCoordinates(currentSample, nextSample);
     if (segmentDistance < 0.01) continue;
-    const elevationChange = terrain.elevationAt(to) - terrain.elevationAt(from);
+    const toElevation = terrain.elevationAt(nextSample);
+    const elevationChange = toElevation - previousElevation;
     const grade = elevationChange / segmentDistance;
-    const cell = terrainFor(terrain, to);
+    const cell = terrainFor(terrain, nextSample);
 
     distanceMeters += segmentDistance;
     elevationChangeMeters += elevationChange;
@@ -583,6 +598,10 @@ const pathProfile = (
     timeMinutes += segmentDistance / speedMetersPerMinute(profile, grade, surface);
     waterRisk = Math.max(waterRisk, cell.waterRisk);
     sideSlopeDegrees = Math.max(sideSlopeDegrees, cell.slopeDegrees);
+
+    previousElevation = toElevation;
+    currentSample.lat = nextSample.lat;
+    currentSample.lng = nextSample.lng;
   }
 
   return {
@@ -612,7 +631,9 @@ const terrainSegmentAllowed = (
   input: OSMRoutingRequest,
 ): boolean => {
   const length = distanceBetweenCoordinates(from, to);
-  for (const road of roadCandidatesForLine(graph, from, to)) {
+  const roadCandidates = roadCandidatesForLine(graph, from, to);
+  if (!roadCandidates) return true;
+  for (const road of roadCandidates) {
     const intersection = segmentIntersection(from, to, road.from, road.to);
     if (!intersection) continue;
     // No "near this segment's own endpoint" exemption here: this same check
@@ -692,7 +713,7 @@ const edgeCost = (
   terrain: TerrainModel,
   graph: Graph,
 ): number => {
-  const profile = pathProfile([from, to], terrain, input.profile, edge.surface);
+  const profile = segmentProfile(from, to, terrain, input.profile, edge.surface);
   if (!edgeAllowed(edge, profile, input, graph, from, to)) return Number.POSITIVE_INFINITY;
   const waterPenalty = 1 + profile.waterRisk * (input.avoidWater ? 6 : 1.2);
   return Math.max(0.001, profile.timeMinutes * waterPenalty);
@@ -718,10 +739,12 @@ const smoothConnectorPath = (
   while (anchor < path.length - 1) {
     let next = anchor + 1;
     for (let candidate = path.length - 1; candidate > anchor + 1; candidate -= 1) {
-      const segment = [path[anchor], path[candidate]];
       if (
         terrainSegmentAllowed(path[anchor], path[candidate], graph, input) &&
-        profileAllowed(pathProfile(segment, terrain, input.profile, "open-terrain"), input)
+        profileAllowed(
+          segmentProfile(path[anchor], path[candidate], terrain, input.profile, "open-terrain"),
+          input,
+        )
       ) {
         next = candidate;
         break;
@@ -752,7 +775,7 @@ const terrainConnectorPath = (
   if (startId === goalId) {
     const direct = [from, to];
     return terrainSegmentAllowed(from, to, graph, input) &&
-      profileAllowed(pathProfile(direct, terrain, input.profile, "open-terrain"), input)
+      profileAllowed(segmentProfile(from, to, terrain, input.profile, "open-terrain"), input)
       ? direct
       : undefined;
   }
@@ -787,8 +810,9 @@ const terrainConnectorPath = (
       if (!nextCell) continue;
       const nextId = nextCell.row * terrain.columns + nextCell.column;
       if (!terrainSegmentAllowed(currentCell.coordinate, nextCell.coordinate, graph, input)) continue;
-      const profile = pathProfile(
-        [currentCell.coordinate, nextCell.coordinate],
+      const profile = segmentProfile(
+        currentCell.coordinate,
+        nextCell.coordinate,
         terrain,
         input.profile,
         "open-terrain",
@@ -822,8 +846,9 @@ const terrainConnectorPath = (
   let total = 0;
   for (let index = 1; index < path.length; index += 1) {
     if (!terrainSegmentAllowed(path[index - 1], path[index], graph, input)) return undefined;
-    const profile = pathProfile(
-      [path[index - 1], path[index]],
+    const profile = segmentProfile(
+      path[index - 1],
+      path[index],
       terrain,
       input.profile,
       "open-terrain",
@@ -862,7 +887,7 @@ const connectorCost = (
   let cost = 0;
   for (let index = 1; index < path.length; index += 1) {
     cost += connectorStepCost(
-      pathProfile([path[index - 1], path[index]], terrain, input.profile, "open-terrain"),
+      segmentProfile(path[index - 1], path[index], terrain, input.profile, "open-terrain"),
       input,
       flavor,
     );
@@ -972,7 +997,7 @@ const appendPolyline = (
     const from = path[index - 1];
     const to = path[index];
     if (distanceBetweenCoordinates(from, to) < 0.5) continue;
-    const profile = pathProfile([from, to], terrain, input.profile, surface);
+    const profile = segmentProfile(from, to, terrain, input.profile, surface);
     segments.push({
       from,
       to,
