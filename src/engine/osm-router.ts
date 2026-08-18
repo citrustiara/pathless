@@ -105,6 +105,8 @@ type GraphEdge = {
   walkway: boolean;
   bridge: boolean;
   tunnel: boolean;
+  /** This edge sits right next to where its mapped way touches a road mid-way, not at its own end. */
+  crossesStreet: boolean;
   highway?: string;
   surface: SurfaceClass;
   name?: string;
@@ -284,7 +286,13 @@ const graphNodeFor = (graph: Graph, coordinate: Coordinate): number => {
   return id;
 };
 
-const addGraphEdge = (graph: Graph, from: number, to: number, feature: OSMFeature): void => {
+const addGraphEdge = (
+  graph: Graph,
+  from: number,
+  to: number,
+  feature: OSMFeature,
+  crossesStreet = false,
+): void => {
   if (from === to) return;
   const source = graph.nodes[from];
   const target = graph.nodes[to];
@@ -301,6 +309,7 @@ const addGraphEdge = (graph: Graph, from: number, to: number, feature: OSMFeatur
     walkway: hasWalkwayEvidence(feature),
     bridge: lower(feature.bridge).length > 0,
     tunnel: lower(feature.tunnel).length > 0,
+    crossesStreet,
     highway: feature.highway,
     surface: surfaceClassFor(feature),
     name: feature.name,
@@ -344,6 +353,9 @@ const crossingCandidatesNear = (graph: Graph, point: Coordinate): Coordinate[] =
   return [...candidates];
 };
 
+/** A way OSM tags as an actual pedestrian crossing, not merely a point that touches a road. */
+const isTaggedCrossing = (feature: OSMFeature): boolean => lower(feature.crossing).length > 0;
+
 const deriveCrossingPoints = (
   pathSegments: RoadSegment[],
   roadIndex: Map<string, RoadSegment[]>,
@@ -356,6 +368,9 @@ const deriveCrossingPoints = (
       for (const road of roadIndex.get(key) ?? []) candidates.add(road);
     }
     for (const road of candidates) {
+      // A path merely touching a road in the imported data is not evidence
+      // anyone may cross there; only a way OSM tags as a crossing counts.
+      if (!isTaggedCrossing(pathSegment.feature) && !isTaggedCrossing(road.feature)) continue;
       // A bridge or underpass only counts as a crossing if the layers agree.
       if (isBridgeOrTunnel(pathSegment.feature) !== isBridgeOrTunnel(road.feature) &&
           featureLayer(pathSegment.feature) !== featureLayer(road.feature)) continue;
@@ -383,6 +398,17 @@ const buildGraph = (features: readonly OSMFeature[]): Graph => {
   };
   const pathSegments: RoadSegment[] = [];
 
+  // A mapped path that touches a road *mid-way through its own geometry*
+  // (not at its own start or end) physically crosses that road there; the
+  // edges either side of that touch are flagged below so they get the same
+  // permission check as an off-trail crossing. A path that merely starts or
+  // ends at a road is an ordinary junction, not a crossing.
+  const roadCoordinateKeys = new Set<string>();
+  for (const feature of features) {
+    if (!isStreetFeature(feature) || isAccessRestricted(feature)) continue;
+    for (const [lat, lng] of feature.coordinates) roadCoordinateKeys.add(coordinateKey({ lat, lng }));
+  }
+
   for (const feature of features) {
     if (isAccessRestricted(feature)) continue;
     const nodeIds = feature.coordinates.map((coordinate) => {
@@ -390,9 +416,13 @@ const buildGraph = (features: readonly OSMFeature[]): Graph => {
       if (isPathEvidence(feature)) graph.nodes[id].pathEvidence = true;
       return id;
     });
+    const interiorRoadTouch = feature.coordinates.map((coordinate, index) =>
+      isPathEvidence(feature) && index > 0 && index < feature.coordinates.length - 1 &&
+      roadCoordinateKeys.has(coordinateKey({ lat: coordinate[0], lng: coordinate[1] })));
     for (let index = 1; index < nodeIds.length; index += 1) {
-      addGraphEdge(graph, nodeIds[index - 1], nodeIds[index], feature);
-      addGraphEdge(graph, nodeIds[index], nodeIds[index - 1], feature);
+      const crossesStreet = interiorRoadTouch[index - 1] || interiorRoadTouch[index];
+      addGraphEdge(graph, nodeIds[index - 1], nodeIds[index], feature, crossesStreet);
+      addGraphEdge(graph, nodeIds[index], nodeIds[index - 1], feature, crossesStreet);
       const segment = {
         from: { lat: feature.coordinates[index - 1][0], lng: feature.coordinates[index - 1][1] },
         to: { lat: feature.coordinates[index][0], lng: feature.coordinates[index][1] },
@@ -642,9 +672,14 @@ const edgeAllowed = (
   edge: GraphEdge,
   profile: PathProfile,
   input: OSMRoutingRequest,
+  graph: Graph,
+  from: Coordinate,
+  to: Coordinate,
 ): boolean => {
   if (edge.street && !edge.walkway && !input.allowStreetWalking) return false;
   if (edge.surface === "steps" && input.profile === "mtb") return false;
+  if (edge.crossesStreet && !input.allowStreetCrossing &&
+      !nearMappedCrossing(graph, from) && !nearMappedCrossing(graph, to)) return false;
   return profileAllowed(profile, input, edge.bridge || edge.tunnel);
 };
 
@@ -654,9 +689,10 @@ const edgeCost = (
   edge: GraphEdge,
   input: OSMRoutingRequest,
   terrain: TerrainModel,
+  graph: Graph,
 ): number => {
   const profile = pathProfile([from, to], terrain, input.profile, edge.surface);
-  if (!edgeAllowed(edge, profile, input)) return Number.POSITIVE_INFINITY;
+  if (!edgeAllowed(edge, profile, input, graph, from, to)) return Number.POSITIVE_INFINITY;
   const waterPenalty = 1 + profile.waterRisk * (input.avoidWater ? 6 : 1.2);
   return Math.max(0.001, profile.timeMinutes * waterPenalty);
 };
@@ -856,7 +892,7 @@ const searchNetwork = (
 
     for (const edge of currentNode.edges) {
       const nextCost = current.cost +
-        edgeCost(currentNode.coordinate, graph.nodes[edge.to].coordinate, edge, input, terrain);
+        edgeCost(currentNode.coordinate, graph.nodes[edge.to].coordinate, edge, input, terrain, graph);
       if (!Number.isFinite(nextCost) || nextCost >= costs[edge.to]) continue;
       costs[edge.to] = nextCost;
       previous[edge.to] = current.node;
