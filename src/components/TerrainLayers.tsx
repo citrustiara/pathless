@@ -25,14 +25,25 @@ const FLAT_SHADE = Math.sin(SUN_ALTITUDE);
 const RELIEF_EXAGGERATION = 2.8;
 const RELIEF_CONTRAST = 1.15;
 
-/** Hypsometric ramp, low ground to high ground. */
+/**
+ * Hypsometric ramp, low ground to high ground. The stops span a wide hue and
+ * lightness range on purpose: Sopocka is a low hill, so its whole relief
+ * already gets stretched across exactly this ramp (`renderRaster` normalises
+ * by the grid's own min/max, not a fixed elevation scale) — the only way for
+ * that stretch to actually read as "exaggerated" on screen is for the ramp
+ * itself to carry a lot of contrast between its stops.
+ */
 const RAMP: Array<[number, [number, number, number]]> = [
-  [0, [96, 148, 118]],
-  [0.26, [148, 180, 124]],
-  [0.5, [200, 204, 142]],
-  [0.72, [224, 202, 152]],
-  [1, [198, 160, 130]],
+  [0, [24, 108, 100]],
+  [0.2, [58, 145, 84]],
+  [0.4, [154, 191, 68]],
+  [0.58, [230, 204, 68]],
+  [0.75, [223, 146, 55]],
+  [0.9, [193, 84, 62]],
+  [1, [138, 46, 66]],
 ];
+/** Stretches the normalised elevation away from the midpoint before ramp lookup, the same trick `RELIEF_CONTRAST` uses for shading. */
+const TINT_CONTRAST = 1.5;
 
 const rampColor = (position: number): [number, number, number] => {
   for (let index = 1; index < RAMP.length; index += 1) {
@@ -93,7 +104,9 @@ const renderRaster = (grid: ElevationGrid, options: RasterOptions): string => {
       image.data[offset + 3] = Math.round(255 * edge);
 
       if (options.hypsometric) {
-        const [red, green, blue] = rampColor((heightAt(x, y) - grid.minElevation) / relief);
+        const position = (heightAt(x, y) - grid.minElevation) / relief;
+        const stretched = clamp01(0.5 + (position - 0.5) * TINT_CONTRAST);
+        const [red, green, blue] = rampColor(stretched);
         image.data[offset] = red;
         image.data[offset + 1] = green;
         image.data[offset + 2] = blue;
@@ -164,7 +177,7 @@ export function HillshadeLayer({ grid, visible }: LayerProps) {
 }
 
 export function ElevationTintLayer({ grid, visible }: LayerProps) {
-  return useRasterOverlay(grid, visible, "elevation-tint-overlay", 0.42, true);
+  return useRasterOverlay(grid, visible, "elevation-tint-overlay", 0.58, true);
 }
 
 type ContourLayerProps = LayerProps & {
