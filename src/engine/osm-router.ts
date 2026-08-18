@@ -700,8 +700,25 @@ const nearestNodeIds = (
  * steep downhill both cost time; a gentle -5% descent is the fastest case.
  */
 const TOBLER_FLAT = Math.exp(-3.5 * 0.05);
-const gradeSpeedFactor = (grade: number): number =>
+export const gradeSpeedFactor = (grade: number): number =>
   Math.exp(-3.5 * Math.abs(grade + 0.05)) / TOBLER_FLAT;
+
+/**
+ * The grade at which climbing gains height fastest, as a fraction.
+ *
+ * Height gained per minute is grade x speed, and for the curve above that
+ * product peaks where its derivative vanishes, at a grade of 1/3.5 — 28.6%, or
+ * 15.9 degrees. Steeper than this, angling across the slope reaches a point
+ * above you sooner than driving straight at it does, which is why hill paths
+ * switchback. Llobera & Sluckin (2007) derive the same threshold at 16 degrees
+ * from metabolic cost, quite independently of Tobler.
+ *
+ * Nothing reads this constant: the behaviour falls out of the cost function on
+ * its own, and would be double-counted by any penalty added on top. It is here
+ * to name the number the engine is already calibrated to, and is pinned by a
+ * test so a change to the curve cannot quietly move it.
+ */
+export const TOBLER_CRITICAL_GRADE = 1 / 3.5;
 
 const speedMetersPerMinute = (
   profile: ActivityProfile,

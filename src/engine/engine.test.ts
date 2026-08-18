@@ -7,9 +7,11 @@ import {
   distanceBetweenCoordinates,
   routeToGeoJson,
   routeToGpx,
+  gradeSpeedFactor,
   osmGraphStats,
   planOSMRoute,
   suggestContourInterval,
+  TOBLER_CRITICAL_GRADE,
   type Coordinate,
   type GeoBounds,
   type OSMRoutingRequest,
@@ -212,6 +214,48 @@ describe("OSM router", () => {
     const headings = interior.map((segment) => headingDegrees(segment.from, segment.to));
     const offGrid = headings.filter((heading) => offGridDegrees(heading) > 2).length;
     expect(offGrid / headings.length).toBeGreaterThan(0.25);
+  });
+
+  it("gains height fastest at the grade Tobler's curve says it should", () => {
+    // Height per minute is grade x speed, so the fastest way up is wherever
+    // that product peaks -- not the steepest line the cap allows. Sweep the
+    // curve this engine actually uses and check the peak sits where
+    // TOBLER_CRITICAL_GRADE claims, since every switchback below depends on it.
+    let bestGain = 0;
+    let bestGrade = 0;
+    for (let grade = 0.005; grade < 1.5; grade += 0.001) {
+      const gain = grade * gradeSpeedFactor(grade);
+      if (gain > bestGain) {
+        bestGain = gain;
+        bestGrade = grade;
+      }
+    }
+    expect(bestGrade).toBeCloseTo(TOBLER_CRITICAL_GRADE, 2);
+    // 28.6%, i.e. 15.9 degrees -- the 16 degrees Llobera & Sluckin (2007) get
+    // from metabolic cost, by an entirely different route.
+    expect(TOBLER_CRITICAL_GRADE).toBeCloseTo(0.2857, 3);
+    expect((Math.atan(TOBLER_CRITICAL_GRADE) * 180) / Math.PI).toBeCloseTo(15.9, 1);
+  });
+
+  it("traverses a face too steep to climb head-on, even when the cap allows it", () => {
+    // A 57% fall line under a 90% ceiling: nothing here forbids driving
+    // straight up. The router should still decline, because above the critical
+    // grade a traverse reaches a point above you sooner than the direct line
+    // does. That preference is what draws switchbacks, and it comes out of the
+    // cost function rather than any rule written for the purpose.
+    const result = planOSMRoute(
+      { ...baseRequest, maxGradePercent: 90, maxOffTrailMeters: 600 },
+      terrainFor(rampGrid(1600)),
+    );
+    expect(result.routes.length).toBeGreaterThan(0);
+    const climbing = result.routes[0].segments.filter((segment) =>
+      !segment.mappedPath && segment.distanceMeters > 1 && Math.abs(segment.grade) > 0.02);
+    expect(climbing.length).toBeGreaterThan(2);
+    const meanGrade = climbing.reduce((total, segment) => total + Math.abs(segment.grade), 0) /
+      climbing.length;
+    // Nowhere near the 57% fall line, and not creeping along the contours either.
+    expect(meanGrade).toBeLessThan(0.4);
+    expect(meanGrade).toBeGreaterThan(0.15);
   });
 
   it("never exceeds the grade limit on a route it does return", () => {
