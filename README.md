@@ -31,6 +31,42 @@ grid. Given a fall line of 57% and a ceiling of 90% — nothing forbidding the
 direct climb — the router now settles at about 27%. A grade penalty layered on
 top would double-count a calibration that is already right.
 
+### How this compares
+
+Worth knowing what the neighbouring projects do, and where this deliberately
+differs.
+
+- **[BRouter](https://brouter.de/brouter/)** is the established off-road router
+  over OSM. It reads SRTM at its original 90 m spacing and low-pass filters it.
+  This engine measures grade against a 2 m LIDAR grid sampled every 4 m, so a
+  short bank trips the grade cap here and would be averaged away there.
+- **[Skitourenguru](https://www.skitourenguru.com/)** routes across open alpine
+  ground, which is the closest thing to the problem this solves. It runs
+  Dijkstra over a cost surface derived from slope angle, curvature and
+  forestation, via GRASS `r.walk` — architecturally the same shape as the
+  connector search here.
+- **[GRASS `r.walk`](https://grass.osgeo.org/grass-stable/manuals/r.walk.html)**,
+  the tool underneath that, offers 8 neighbours by default and 16 behind its
+  knight's-move flag, noted as more accurate and more expensive. 16 is what this
+  uses, so the move set is at the ceiling that the standard GIS tool offers.
+- **Navmesh string pulling**, the games-industry path smoother, is provably
+  optimal — but only within a corridor of uniform-cost polygons. That
+  assumption does not hold on weighted, direction-dependent terrain, which is
+  why the smoothing pass here was removed rather than improved.
+
+Two things the neighbours have that this does not, on purpose:
+
+- **Turn cost.** BRouter carries an explicit per-turn term. Measured over four
+  real off-trail routes here, the median turn between segments is 4 degrees and
+  only 2 of 88 turns double back at all, so there is next to no jitter for such
+  a term to suppress — and it would tax the switchbacks on steep ground, which
+  are the point. BRouter's turn cost models junction behaviour on a way network,
+  which is a different job.
+- **Curvature.** Skitourenguru separates a convex spur from a concave gully, and
+  the second derivative is cheap given the gradient field already computed here.
+  It is left out because there is no defensible weight to give it: picking one
+  would be inventing a number, which is the thing this engine does not do.
+
 ## Run locally
 
 ```bash
