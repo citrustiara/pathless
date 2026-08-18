@@ -134,7 +134,7 @@ const buildView = (
     status: "ready",
     title: request.mode === "nearest"
       ? "Nearest mapped path"
-      : request.mode === "design"
+      : request.mode === "design" && request.waypoints.length > 0
         ? `Route through ${request.waypoints.length} waypoint${request.waypoints.length === 1 ? "" : "s"}`
         : "Route to target",
     subtitle: primary.wayNames.length > 0

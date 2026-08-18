@@ -16,12 +16,12 @@ type LayerProps = {
 
 /** Hypsometric ramp, low ground to high ground. */
 const RAMP: Array<[number, [number, number, number]]> = [
-  [0, [58, 106, 82]],
-  [0.22, [110, 152, 96]],
-  [0.44, [168, 186, 116]],
-  [0.64, [214, 199, 143]],
-  [0.82, [200, 163, 118]],
-  [1, [160, 118, 92]],
+  [0, [126, 168, 142]],
+  [0.24, [162, 190, 145]],
+  [0.46, [200, 208, 160]],
+  [0.66, [226, 213, 168]],
+  [0.84, [216, 188, 152]],
+  [1, [196, 165, 143]],
 ];
 
 const rampColor = (position: number): [number, number, number] => {
@@ -57,6 +57,8 @@ const renderTerrainRaster = (grid: ElevationGrid, scale: number): string => {
 
   const image = context.createImageData(width, height);
   const relief = Math.max(1, grid.maxElevation - grid.minElevation);
+  const featherX = Math.max(1, width * 0.035);
+  const featherY = Math.max(1, height * 0.035);
   const metersPerPixelX = (grid.longitudeStep * grid.columns * 111_132 *
     Math.cos((grid.bounds.north * Math.PI) / 180)) / width;
   const metersPerPixelY = (grid.latitudeStep * grid.rows * 111_132) / height;
@@ -83,11 +85,16 @@ const renderTerrainRaster = (grid: ElevationGrid, scale: number): string => {
       // Keep the shading gentle so the base map stays readable underneath.
       const lighting = 0.72 + shade * 0.56;
       const [red, green, blue] = rampColor((centre - grid.minElevation) / relief);
+      const edge = Math.min(
+        x / featherX, (width - 1 - x) / featherX,
+        y / featherY, (height - 1 - y) / featherY,
+        1,
+      );
       const offset = (y * width + x) * 4;
       image.data[offset] = Math.min(255, red * lighting);
       image.data[offset + 1] = Math.min(255, green * lighting);
       image.data[offset + 2] = Math.min(255, blue * lighting);
-      image.data[offset + 3] = 255;
+      image.data[offset + 3] = Math.round(255 * edge);
     }
   }
 
@@ -114,7 +121,7 @@ export function ElevationTintLayer({ grid, visible }: LayerProps) {
         [grid.bounds.south - halfLatitude, grid.bounds.west - halfLongitude],
         [grid.bounds.north + halfLatitude, grid.bounds.east + halfLongitude],
       ],
-      { opacity: 0.5, interactive: false, className: "elevation-tint-overlay", pane: "tilePane" },
+      { opacity: 0.46, interactive: false, className: "elevation-tint-overlay", pane: "tilePane" },
     ).addTo(map);
     return () => {
       overlay.remove();
@@ -124,17 +131,11 @@ export function ElevationTintLayer({ grid, visible }: LayerProps) {
   return null;
 }
 
-export type ContourStyle = {
-  interval: number;
-  lineCount: number;
-};
-
 type ContourLayerProps = LayerProps & {
-  onStyle?: (style: ContourStyle) => void;
   interval: number;
 };
 
-export function ContourLayer({ grid, visible, interval, onStyle }: ContourLayerProps) {
+export function ContourLayer({ grid, visible, interval }: ContourLayerProps) {
   const map = useMap();
   const contours = useMemo(() => {
     if (grid.rows <= 2 || interval <= 0) return [];
@@ -143,17 +144,13 @@ export function ContourLayer({ grid, visible, interval, onStyle }: ContourLayerP
   }, [grid, interval]);
 
   useEffect(() => {
-    onStyle?.({ interval, lineCount: contours.length });
-  }, [contours.length, interval, onStyle]);
-
-  useEffect(() => {
     if (!visible || contours.length === 0) return;
     const group = L.layerGroup([], { pane: "overlayPane" }).addTo(map);
     for (const contour of contours) {
       L.polyline(contour.points, {
-        color: contour.index ? "#7a6142" : "#8d7a5c",
-        weight: contour.index ? 1.25 : 0.7,
-        opacity: contour.index ? 0.72 : 0.5,
+        color: contour.index ? "#6f5738" : "#87724f",
+        weight: contour.index ? 1.4 : 0.85,
+        opacity: contour.index ? 0.82 : 0.58,
         interactive: false,
         lineJoin: "round",
         lineCap: "round",

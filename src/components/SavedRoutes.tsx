@@ -70,11 +70,11 @@ export function SavedRoutes({ routes, onRestore, onDelete }: SavedRoutesProps) {
                 <button className="saved-restore" type="button" onClick={() => onRestore(route)}>
                   <strong>{route.name}</strong>
                   <small>
-                    {(route.distanceMeters / 1_000).toFixed(2)} km
-                    <span className="saved-dot-divider" />
-                    {Math.round(route.durationMinutes)} min
-                    <span className="saved-dot-divider" />
-                    {route.mode === "nearest" ? "Nearest path" : route.mode === "design" ? "Design route" : "Destination"}
+                    <span>{(route.distanceMeters / 1_000).toFixed(2)} km</span>
+                    <span>{Math.round(route.durationMinutes)} min</span>
+                    <span>
+                      {route.mode === "nearest" ? "Nearest path" : route.mode === "design" ? "Design route" : "Destination"}
+                    </span>
                   </small>
                   <span className="saved-time"><Clock3 size={10} />{formatSavedAt(route.savedAt)}</span>
                 </button>

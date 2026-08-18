@@ -1,64 +1,71 @@
 # Pathless
 
-Pathless is an open-source prototype for terrain-aware routing across both mapped and unmapped land. A normal map router can only choose among the paths it knows. Pathless is intended to combine known paths with terrain evidence so that a route can explain when it stays on a mapped track, when it crosses open ground, and what terrain signal influenced that choice.
+Pathless is an open-source prototype for terrain-aware routing across both mapped and unmapped land. A normal map router can only choose among the paths it knows. Pathless combines known paths with measured terrain, so a route can say when it stays on a mapped track, when it crosses open ground, and what the ground actually does along the way.
 
-The project is deliberately a prototype. The map uses a bounded, checked-in OpenStreetMap snapshot around the supplied Sopocka forest coordinate. The current elevation and terrain-cost model is still deterministic synthetic data; it is labelled as such in the UI and is the seam for a future Geoportal/LiDAR adapter.
+The guiding rule is that the engine does not score what it cannot measure. Elevation, grade, climb, and travel time come from a real elevation model. Surface comes from the way's own OpenStreetMap tags. Vegetation, deadfall, and undergrowth are not modelled at all, and the UI says so rather than inventing a number for them.
 
-## What is in the current prototype
+## What the prototype does
 
-The current prototype provides:
+- Loads a real elevation model for the working area from the public [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) and resamples it to roughly 12 m spacing.
+- Draws that elevation as contour lines and a hypsometric tint with shaded relief, both computed in the browser from the same grid the router uses.
+- Routes over a checked-in OpenStreetMap snapshot of Sopocka, joining mapped ways with A\* connectors across the terrain grid.
+- Costs every metre as estimated travel time, from a normalised Tobler hiking curve applied to the real local grade, scaled by the way's mapped surface and by the chosen travel style.
+- Enforces limits that mean something on the ground: a maximum grade along the route, a maximum length for any single off-trail stretch, and explicit permissions for crossing streets, walking along streets, and entering mapped watercourses.
+- Offers up to three honestly labelled options: balanced, most direct, and stay-on-trails. Objectives that agree on the same line are offered once, not relabelled.
+- Reports distance, moving time, climb, steepest grade, an elevation profile, and a surface breakdown taken from OSM tags.
+- Exports GPX and GeoJSON with elevation, and keeps the full request in the URL so a route can be shared or reloaded.
 
-- a real OSM tile basemap centered on `54.458403, 18.509192`;
-- a normalized OSM snapshot in [`src/data/sopocka-osm.json`](src/data/sopocka-osm.json) containing roads, tracks, footways, cycleways, and water features around Sopocka;
-- real imported path geometry highlighted on top of the basemap;
-- an OSM-network router for nearest-path, destination, and waypoint route experiments;
-- a low-opacity Geoportal NMT hillshade layer for real terrain context;
-- hard slope, roughness, water, road-crossing, and road-walking constraints, with road permissions off by default;
-- sampled 25 m terrain-grid A* connectors that bend around steep or rough cells instead of drawing an unchecked straight line;
-- explicit source labels distinguishing OSM geometry, Geoportal visualization, and synthetic elevation costs.
-
-The OSM snapshot is real map data, but it does not prove that a way is open, legal, safe, or passable today. The route line is still a prototype terrain result and must not be treated as navigation advice.
+The OSM snapshot is real map data, but it does not prove that a way is open, legal, safe, or passable today. A route across unmapped land is a suggestion to investigate, never navigation advice.
 
 ## Run locally
-
-Use the repository's existing package setup:
 
 ```bash
 npm install
 npm run dev
 ```
 
-Vite serves the development app at the address it prints, normally `http://127.0.0.1:4173`.
-
-Useful checks:
+Vite serves the app at `http://127.0.0.1:4173`.
 
 ```bash
 npm run lint
+npm test
 npm run build
-npm run preview
 ```
 
-The `test` script is already defined in `package.json`; add or run Vitest tests as the engine and UI grow.
+## How it fits together
 
-## Terrain prototype and imported area
+```
+elevation tiles ──► ElevationGrid ──┬─► contours + relief raster  (src/components/TerrainLayers.tsx)
+                                    │
+OSM snapshot ──► routing graph ─────┴─► TerrainModel ──► planOSMRoute  (src/engine/osm-router.ts)
+```
 
-The map view covers the supplied Sopocka forest area near Gdynia, Poland, bounded by approximately 54.4422–54.4746 latitude and 18.4813–18.5371 longitude. OSM ways are stored as `[latitude, longitude]` pairs for the Leaflet map. The app uses a synthetic 25 m terrain preview grid centered on the same coordinate for slope, roughness, water-risk, and ascent costs. The Geoportal hillshade is real NMT-derived imagery, but its pixels are not sampled into the route cost function: hillshade is a visualization, not an elevation raster. A no-route result is shown honestly when hard constraints leave no feasible connection.
+- [`src/engine/elevation.ts`](src/engine/elevation.ts) fetches and decodes terrarium tiles into a latitude/longitude-regular grid, and derives contour polylines with marching squares.
+- [`src/engine/terrain.ts`](src/engine/terrain.ts) lays a 25 m routing grid over the area, filling it with elevation, Horn-method slope, a terrain ruggedness index, and proximity to mapped watercourses.
+- [`src/engine/osm-router.ts`](src/engine/osm-router.ts) builds the way graph, derives street-crossing evidence from where paths and roads actually intersect, and searches the combined network.
+- [`src/engine/geo.ts`](src/engine/geo.ts) holds the small-area geodesy shared by all of the above.
 
-The older [`src/data/demo.ts`](src/data/demo.ts) module remains as a typed synthetic fixture for engine tests and adapter contracts. It is not rendered as the basemap or presented as real-world geometry.
+### When elevation is unavailable
+
+If the terrain tiles cannot be reached, the terrain model reports `hasElevation: false`, every cell stays at zero, and climb and grade are shown as `—` rather than as plausible-looking numbers. Routing still works on distance and surface alone, and both the route notes and the sidebar say what is missing.
+
+## Imported area
+
+The map covers the Sopocka forest area near Gdynia, Poland, bounded by 54.445–54.470 latitude and 18.480–18.535 longitude. OSM ways are stored as `[latitude, longitude]` pairs. The snapshot can be regenerated from an Overpass response with [`scripts/import-osm.mjs`](scripts/import-osm.mjs).
 
 ## Data and adapter direction
 
 The data module keeps source metadata separate from routing policy. Future adapters should normalize external data into the same small contract and leave cost functions, barriers, and route selection to the engine.
 
-- **OpenStreetMap** supplies the current basemap and imported mapped ways. The snapshot can be regenerated from an Overpass response with [`scripts/import-osm.mjs`](scripts/import-osm.mjs). Keep `© OpenStreetMap contributors` visible when OSM-derived data or tiles are shown, follow the [ODbL requirements](https://www.openstreetmap.org/copyright), and review the service's usage limits before production use.
-- **Geoportal** supplies the current hillshade overlay through its NMT WMS service and remains an intended source for sampled elevation, land cover, and orthophotography. The [Geoportal portal](https://www.geoportal.gov.pl/) exposes multiple services with different terms; an adapter must record the specific layer, date, CRS, attribution, and usage conditions.
-- **LiDAR/elevation** is intended to supply a normalized elevation surface and derived terrain signals such as slope, roughness, and wetness proxies. The adapter should preserve source resolution and vertical datum metadata and should not assume that a derived value is a safety guarantee.
+- **OpenStreetMap** supplies the basemap and the imported ways. Keep `© OpenStreetMap contributors` visible wherever OSM-derived data or tiles are shown, follow the [ODbL requirements](https://www.openstreetmap.org/copyright), and review the tile usage policy before production use.
+- **AWS Terrain Tiles** supply elevation, themselves assembled from SRTM, EU-DEM, and national sources of differing resolution and vintage. An adapter that replaces them should preserve source resolution and vertical-datum metadata.
+- **Higher-resolution LiDAR**, such as the Polish Geoportal NMT, would improve grade accuracy and is the natural next source. It is also the only realistic route to modelling ground cover, which the current engine deliberately leaves out.
 
-A production adapter should also make freshness, coverage gaps, confidence, and uncertainty explicit. A missing mapped path is not evidence that no path exists, and an apparently passable terrain cell is not permission to cross it.
+A production adapter should make freshness, coverage gaps, confidence, and uncertainty explicit. A missing mapped path is not evidence that no path exists, and an apparently passable terrain cell is not permission to cross it.
 
 ## Legal and data caveats
 
-This repository is source code, a bounded OSM-derived snapshot, and a synthetic terrain fixture. Before refreshing or connecting a real provider:
+This repository is source code plus a bounded OSM-derived snapshot. Before refreshing or connecting a real provider:
 
 1. read the current license and service terms for every layer and endpoint;
 2. preserve required attribution and, where applicable, ODbL-derived-database obligations;
@@ -67,14 +74,14 @@ This repository is source code, a bounded OSM-derived snapshot, and a synthetic 
 5. treat routes across unmapped land as suggestions for investigation, never as proof of access or a safe path;
 6. avoid presenting stale or low-confidence terrain data as authoritative navigation advice.
 
-The project is not legal, surveying, emergency-response, or outdoor-safety advice. The adapter metadata is intentionally conservative; provider-specific legal review remains necessary.
+The project is not legal, surveying, emergency-response, or outdoor-safety advice.
 
 ## Next steps
 
-1. Sample Geoportal/LiDAR elevation values into the route cost function with CRS, resolution, freshness, and vertical-datum metadata.
-2. Improve OSM graph snapping and add land-cover, protected-area, access, and seasonal-closure constraints.
-3. Show confidence and uncertainty in the UI, including why an unmapped segment was selected.
-4. Add exportable provenance and integration tests before treating results as operational.
+1. Move routing into a worker so large areas stay interactive.
+2. Add land-cover, protected-area, and seasonal-closure constraints from OSM polygons.
+3. Sample a higher-resolution national DEM where one is available, keeping CRS and vertical-datum metadata.
+4. Add exportable provenance before treating any result as operational.
 
 ## License
 

@@ -131,7 +131,7 @@ function FitRoute({ route, detailsHidden }: { route?: OSMRoute; detailsHidden: b
       map.fitBounds(routeLatLngs(route), {
         paddingTopLeft: [70, 70],
         paddingBottomRight: detailsHidden ? [70, 70] : [400, 90],
-        maxZoom: 17,
+        maxZoom: 16,
         animate: false,
       });
     });
