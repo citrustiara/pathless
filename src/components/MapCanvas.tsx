@@ -575,7 +575,11 @@ export function MapCanvas({
             <ScaleReadout />
             <div className="map-attribution">
               Map data <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors,
-              elevation from <a href="https://registry.opendata.aws/terrain-tiles/">AWS Terrain Tiles</a>
+              elevation from {elevationGrid
+                ? elevationGrid.sourceUrl
+                  ? <a href={elevationGrid.sourceUrl}>{elevationGrid.attribution}</a>
+                  : elevationGrid.attribution
+                : "a public elevation model"}
             </div>
           </div>
 

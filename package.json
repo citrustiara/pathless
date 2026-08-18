@@ -22,6 +22,7 @@
     "@types/leaflet": "latest",
     "@types/react": "latest",
     "@types/react-dom": "latest",
+    "proj4": "latest",
     "typescript": "latest",
     "vite": "latest",
     "vitest": "latest"

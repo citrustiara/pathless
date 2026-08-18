@@ -27,6 +27,7 @@ import type {
   RouteView,
 } from "./components/pathless-types";
 import { SOPOCKA_BOUNDS, SOPOCKA_OSM_METADATA, SOPOCKA_WATERWAYS } from "./data/sopocka";
+import { loadSopockaDtmGrid } from "./data/sopocka-dtm";
 import {
   clamp,
   createTerrainModel,
@@ -87,7 +88,12 @@ const toRoutingRequest = (request: RouteRequest): OSMRoutingRequest => ({
 const shareOf = (part: number, whole: number): number =>
   Math.round((part / Math.max(whole, 1)) * 100);
 
-const buildNotes = (route: OSMRoute, request: RouteRequest, terrain: TerrainModel): string[] => {
+const buildNotes = (
+  route: OSMRoute,
+  request: RouteRequest,
+  terrain: TerrainModel,
+  elevation: ElevationGrid | undefined,
+): string[] => {
   const mapped = shareOf(route.mappedDistanceMeters, route.distanceMeters);
   const notes = [
     mapped > 0
@@ -97,7 +103,7 @@ const buildNotes = (route: OSMRoute, request: RouteRequest, terrain: TerrainMode
       ? `${Math.round(route.offTrailDistanceMeters)} m is off-trail, the longest single stretch being ${Math.round(route.longestOffTrailMeters)} m.`
       : "The route never leaves a mapped way.",
     terrain.hasElevation
-      ? "Climb, grade, and time come from a public elevation model at roughly 12 m spacing."
+      ? `Climb, grade, and time come from ${elevation?.attribution ?? "a public elevation model"}.`
       : "Elevation was unavailable, so climb and grade are reported as zero rather than guessed.",
     "Ground cover is not modelled: undergrowth, deadfall, and fences will not appear here.",
     request.settings.allowStreetCrossing
@@ -113,6 +119,7 @@ const buildNotes = (route: OSMRoute, request: RouteRequest, terrain: TerrainMode
 const buildView = (
   request: RouteRequest,
   terrain: TerrainModel,
+  elevation: ElevationGrid | undefined,
   preferredObjective?: string,
 ): RouteView => {
   const result = planOSMRoute(toRoutingRequest(request), terrain);
@@ -147,7 +154,7 @@ const buildView = (
       : `${shareOf(primary.mappedDistanceMeters, primary.distanceMeters)}% on mapped ways`,
     route: primary,
     alternatives: result.routes.filter((_, index) => index !== chosen),
-    notes: buildNotes(primary, request, terrain),
+    notes: buildNotes(primary, request, terrain, elevation),
   };
 };
 
@@ -263,11 +270,20 @@ export function App() {
     [mode, profile, settings, start, target, waypoints],
   );
 
-  const [view, setView] = useState<RouteView>(() => buildView(request, buildTerrain()));
+  const [view, setView] = useState<RouteView>(() => buildView(request, buildTerrain(), undefined));
   const [isCalculating, setIsCalculating] = useState(false);
   useEffect(() => {
     let cancelled = false;
-    loadElevationGrid(SOPOCKA_BOUNDS)
+    // The Sopocka area has a baked, GUGiK-sourced LIDAR terrain model (see
+    // scripts/import-dtm.mjs) — far higher resolution than the public
+    // tiles, and already bundled, so it's just a local chunk load rather
+    // than a live fetch. Global AWS elevation tiles are the fallback if
+    // that ever fails.
+    loadSopockaDtmGrid()
+      .catch((error) => {
+        console.warn("Baked Poland terrain unavailable, falling back to global elevation tiles.", error);
+        return loadElevationGrid(SOPOCKA_BOUNDS);
+      })
       .then((grid) => {
         if (cancelled) return;
         setElevation(grid);
@@ -286,11 +302,11 @@ export function App() {
   useEffect(() => {
     setIsCalculating(true);
     const timer = window.setTimeout(() => {
-      setView(buildView(request, terrain, preferredObjective));
+      setView(buildView(request, terrain, elevation, preferredObjective));
       setIsCalculating(false);
     }, RECALCULATE_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [preferredObjective, request, terrain]);
+  }, [elevation, preferredObjective, request, terrain]);
 
   useEffect(() => {
     writeStateToUrl({ mode, profile, settings, start, target, waypoints });

@@ -31,6 +31,7 @@ export type ElevationGrid = {
   readonly minElevation: number;
   readonly maxElevation: number;
   readonly attribution: string;
+  readonly sourceUrl?: string;
   /** Bilinear sample, clamped to the grid edges. */
   sample(lat: number, lng: number): number;
 };
@@ -135,6 +136,7 @@ const buildGrid = (
   columns: number,
   data: Float32Array,
   attribution: string,
+  sourceUrl?: string,
 ): ElevationGrid => {
   const latitudeStep = (bounds.north - bounds.south) / (rows - 1);
   const longitudeStep = (bounds.east - bounds.west) / (columns - 1);
@@ -155,6 +157,7 @@ const buildGrid = (
     minElevation: Number.isFinite(minElevation) ? minElevation : 0,
     maxElevation: Number.isFinite(maxElevation) ? maxElevation : 0,
     attribution,
+    sourceUrl,
     sample(lat: number, lng: number): number {
       const rowPosition = clamp((bounds.north - lat) / latitudeStep, 0, rows - 1);
       const columnPosition = clamp((lng - bounds.west) / longitudeStep, 0, columns - 1);
@@ -181,7 +184,8 @@ export const createElevationGrid = (
   columns: number,
   data: Float32Array,
   attribution = "Supplied elevation samples",
-): ElevationGrid => buildGrid(bounds, rows, columns, data, attribution);
+  sourceUrl?: string,
+): ElevationGrid => buildGrid(bounds, rows, columns, data, attribution, sourceUrl);
 
 /** A grid of zeroes, used when the tiles cannot be reached. */
 export const createFlatElevationGrid = (bounds: GeoBounds): ElevationGrid =>
@@ -223,7 +227,14 @@ export const loadElevationGrid = async (
     }
   }
 
-  return buildGrid(bounds, rows, columns, data, "Elevation: AWS Terrain Tiles (SRTM, EU-DEM)");
+  return buildGrid(
+    bounds,
+    rows,
+    columns,
+    data,
+    `AWS Terrain Tiles (SRTM, EU-DEM), ~${Math.round(spacing)} m grid`,
+    "https://registry.opendata.aws/terrain-tiles/",
+  );
 };
 
 /** Separable 3-tap blur; removes single-sample noise before contouring. */
