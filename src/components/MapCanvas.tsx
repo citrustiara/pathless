@@ -218,6 +218,7 @@ export type MapContextMenu = {
   y: number;
   lat: number;
   lng: number;
+  waypointIndex?: number;
 };
 
 function MapInteractions({
@@ -351,6 +352,7 @@ export function MapCanvas({
 
   const primary = view.route;
   const cursorElevation = cursor && terrain.hasElevation ? terrain.elevationAt(cursor) : null;
+  const contextMenuWaypointIndex = contextMenu?.waypointIndex;
 
   const togglePlacement = (next: Exclude<PlacementMode, null>) =>
     onPlacementModeChange(placementMode === next ? null : next);
@@ -472,12 +474,18 @@ export function MapCanvas({
               contextmenu: (event) => {
                 event.originalEvent.preventDefault();
                 event.originalEvent.stopPropagation();
-                onRemoveWaypoint(index);
+                setContextMenu({
+                  x: event.containerPoint.x,
+                  y: event.containerPoint.y,
+                  lat: event.latlng.lat,
+                  lng: event.latlng.lng,
+                  waypointIndex: index,
+                });
               },
             }}
           >
             <Tooltip direction="top" offset={[0, -12]}>
-              Waypoint {index + 1}. Drag to move, right-click to remove.
+              Waypoint {index + 1}. Drag to move, right-click for options.
             </Tooltip>
           </Marker>
         ))}
@@ -607,6 +615,11 @@ export function MapCanvas({
               style={{ left: contextMenu.x, top: contextMenu.y }}
               role="menu"
             >
+              {contextMenuWaypointIndex !== undefined && (
+                <button type="button" role="menuitem" onClick={() => { onRemoveWaypoint(contextMenuWaypointIndex); setContextMenu(null); }}>
+                  <span className="place-dot place-dot-waypoint" />Remove waypoint {contextMenuWaypointIndex + 1}
+                </button>
+              )}
               <button type="button" role="menuitem" onClick={() => { onMovePoint("start", 0, contextMenu); setContextMenu(null); }}>
                 <span className="place-dot place-dot-start" />Start here
               </button>
