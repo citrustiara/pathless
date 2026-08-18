@@ -160,6 +160,12 @@ const SAMPLE_SPACING_METERS = 18;
 const SPATIAL_BUCKET_DEGREES = 0.001;
 const ROAD_CROSSING_TOLERANCE_METERS = 24;
 
+/** The headings the off-trail grid search may step in, as (row, column) offsets. */
+const CONNECTOR_DIRECTIONS = [
+  [-1, 0], [1, 0], [0, -1], [0, 1],
+  [-1, -1], [-1, 1], [1, -1], [1, 1],
+] as const;
+
 /** Flat-ground speed in km/h before grade and surface are applied. */
 const FLAT_SPEED_KMH: Record<ActivityProfile, number> = {
   hiker: 4.6,
@@ -859,136 +865,177 @@ const smoothConnectorPath = (
   return smoothed;
 };
 
-const terrainConnectorPath = (
-  from: Coordinate,
-  to: Coordinate,
+type ConnectorDirection = "from-source" | "to-source";
+
+/**
+ * Every off-trail connector between one source and many targets, from a single
+ * grid search.
+ *
+ * `searchNetwork` needs a connector from the origin to each of two dozen
+ * candidate entry nodes, and from each of two dozen exit nodes to the
+ * destination. Every one of those shares an endpoint, so a search per pair
+ * repeats the same expansion two dozen times over. One outward search answers
+ * them all: `previous` already records the best route back to the source from
+ * every cell it settled.
+ *
+ * `direction` exists because Tobler's curve is not symmetric — walking a slope
+ * up and down are different costs. The search always expands away from the
+ * source, but "to-source" prices each step as the walker actually travels it,
+ * towards the source rather than away from it. Every other rule the search
+ * applies (street crossings, the grade cap, water) reads the same either way.
+ */
+const terrainConnectorPaths = (
+  source: Coordinate,
+  targets: readonly Coordinate[],
+  direction: ConnectorDirection,
   input: OSMRoutingRequest,
   terrain: TerrainModel,
   graph: Graph,
   flavor: RouteFlavor,
-): Coordinate[] | undefined => {
+): Map<string, Coordinate[]> => {
   const budget = flavorSettings(input, flavor).maxOffTrailMeters;
-  // A connector can never beat the straight line, so reject early.
-  if (distanceBetweenCoordinates(from, to) > budget) return undefined;
+  const connectors = new Map<string, Coordinate[]>();
 
-  const start = terrainFor(terrain, from);
-  const goal = terrainFor(terrain, to);
-  const startId = start.row * terrain.columns + start.column;
-  const goalId = goal.row * terrain.columns + goal.column;
-  if (startId === goalId) {
-    const direct = [from, to];
-    return terrainSegmentAllowed(from, to, graph, input) &&
-      profileAllowed(segmentProfile(from, to, terrain, input.profile, "open-terrain"), input)
-      ? direct
-      : undefined;
-  }
-
-  const cellCount = terrain.rows * terrain.columns;
-  const scratch = cellSearchScratch(cellCount);
-  const { costs, lengths, priorities, previous, stamp } = scratch;
-  const generation = scratch.generation;
-  terrainCellHeap.clear();
-  costs[startId] = 0;
-  lengths[startId] = 0;
-  priorities[startId] = 0;
-  previous[startId] = -1;
-  stamp[startId] = generation;
-  terrainCellHeap.push(startId, 0);
-  const directions = [
-    [-1, 0], [1, 0], [0, -1], [0, 1],
-    [-1, -1], [-1, 1], [1, -1], [1, 1],
-  ] as const;
-  const fastest = speedMetersPerMinute(input.profile, -0.05, "open-terrain");
-  const goalSlack = distanceBetweenCoordinates(to, goal.coordinate);
-
-  while (terrainCellHeap.size > 0) {
-    const currentNode = terrainCellHeap.pop();
-    if (currentNode < 0) continue;
-    if (stamp[currentNode] !== generation || terrainCellHeap.poppedPriority !== priorities[currentNode]) continue;
-    if (currentNode === goalId) break;
-    const row = Math.floor(currentNode / terrain.columns);
-    const column = currentNode % terrain.columns;
-    const currentCell = terrain.cellAt(row, column);
-    if (!currentCell) continue;
-
-    for (const [rowOffset, columnOffset] of directions) {
-      const nextCell = terrain.cellAt(row + rowOffset, column + columnOffset);
-      if (!nextCell) continue;
-      const nextId = nextCell.row * terrain.columns + nextCell.column;
-      if (!terrainSegmentAllowed(currentCell.coordinate, nextCell.coordinate, graph, input)) continue;
+  /** Order a candidate the way the walker travels it, then hold it to every rule. */
+  const accept = (target: Coordinate, viaCells: readonly Coordinate[]): boolean => {
+    const rawPath = direction === "to-source"
+      ? [target, ...viaCells, source]
+      : [source, ...[...viaCells].reverse(), target];
+    const path = smoothConnectorPath(rawPath, terrain, input, graph);
+    let total = 0;
+    for (let index = 1; index < path.length; index += 1) {
+      if (!terrainSegmentAllowed(path[index - 1], path[index], graph, input)) return false;
       const profile = segmentProfile(
-        currentCell.coordinate,
-        nextCell.coordinate,
+        path[index - 1],
+        path[index],
         terrain,
         input.profile,
         "open-terrain",
       );
+      if (!profileAllowed(profile, input)) return false;
+      total += profile.distanceMeters;
+    }
+    if (total > budget) return false;
+    connectors.set(coordinateKey(target), path);
+    return true;
+  };
+
+  const start = terrainFor(terrain, source);
+  const startId = start.row * terrain.columns + start.column;
+
+  // Several targets can share a cell, and one that sits in the source's own
+  // cell needs no search at all.
+  const targetsByCell = new Map<number, Coordinate[]>();
+  const seen = new Set<string>();
+  for (const target of targets) {
+    const key = coordinateKey(target);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (distanceBetweenCoordinates(source, target) > budget) continue;
+    const cell = terrainFor(terrain, target);
+    const cellId = cell.row * terrain.columns + cell.column;
+    if (cellId === startId) {
+      accept(target, []);
+      continue;
+    }
+    const bucket = targetsByCell.get(cellId);
+    if (bucket) bucket.push(target);
+    else targetsByCell.set(cellId, [target]);
+  }
+  if (targetsByCell.size === 0) return connectors;
+
+  const cellCount = terrain.rows * terrain.columns;
+  const scratch = cellSearchScratch(cellCount);
+  const { costs, lengths, previous, stamp } = scratch;
+  const generation = scratch.generation;
+  terrainCellHeap.clear();
+  costs[startId] = 0;
+  lengths[startId] = 0;
+  previous[startId] = -1;
+  stamp[startId] = generation;
+  terrainCellHeap.push(startId, 0);
+
+  // Plain Dijkstra: with many targets there is no single goal to aim a
+  // heuristic at, and the off-trail budget already bounds the frontier to a
+  // disc of that radius around the source.
+  let unsettled = targetsByCell.size;
+  while (terrainCellHeap.size > 0) {
+    const currentId = terrainCellHeap.pop();
+    if (currentId < 0) continue;
+    if (stamp[currentId] !== generation) continue;
+    if (terrainCellHeap.poppedPriority !== costs[currentId]) continue;
+    if (targetsByCell.has(currentId)) {
+      unsettled -= 1;
+      if (unsettled === 0) break;
+    }
+    const row = Math.floor(currentId / terrain.columns);
+    const column = currentId % terrain.columns;
+    const currentCell = terrain.cellAt(row, column);
+    if (!currentCell) continue;
+
+    for (const [rowOffset, columnOffset] of CONNECTOR_DIRECTIONS) {
+      const nextCell = terrain.cellAt(row + rowOffset, column + columnOffset);
+      if (!nextCell) continue;
+      const nextId = nextCell.row * terrain.columns + nextCell.column;
+      if (!terrainSegmentAllowed(currentCell.coordinate, nextCell.coordinate, graph, input)) continue;
+      const profile = direction === "from-source"
+        ? segmentProfile(currentCell.coordinate, nextCell.coordinate, terrain, input.profile, "open-terrain")
+        : segmentProfile(nextCell.coordinate, currentCell.coordinate, terrain, input.profile, "open-terrain");
       if (!profileAllowed(profile, input)) continue;
-      const nextLength = lengths[currentNode] + profile.distanceMeters;
+      const nextLength = lengths[currentId] + profile.distanceMeters;
       if (nextLength > budget) continue;
-      // The rest of the path can never be shorter than the straight line to the
-      // goal, so anything already over budget by that measure is unreachable —
-      // this prunes the frontier without discarding a cell a valid path could
-      // have used. The slack is because the search ends at the goal *cell*
-      // while the path ends at `to` somewhere inside it.
-      if (nextLength + distanceBetweenCoordinates(nextCell.coordinate, goal.coordinate) >
-          budget + goalSlack) continue;
-      const nextCost = costs[currentNode] + connectorStepCost(profile, input, flavor);
+      const nextCost = costs[currentId] + connectorStepCost(profile, input, flavor);
       if (stamp[nextId] === generation && nextCost >= costs[nextId]) continue;
       costs[nextId] = nextCost;
       lengths[nextId] = nextLength;
-      previous[nextId] = currentNode;
-      priorities[nextId] = nextCost +
-        distanceBetweenCoordinates(nextCell.coordinate, goal.coordinate) / fastest;
+      previous[nextId] = currentId;
       stamp[nextId] = generation;
-      terrainCellHeap.push(nextId, priorities[nextId]);
+      terrainCellHeap.push(nextId, nextCost);
     }
   }
 
-  if (stamp[goalId] !== generation) return undefined;
-  const cells: TerrainCell[] = [];
-  let cursor = goalId;
-  while (cursor >= 0) {
-    const cell = terrain.cellAt(Math.floor(cursor / terrain.columns), cursor % terrain.columns);
-    if (!cell) return undefined;
-    cells.push(cell);
-    cursor = previous[cursor];
+  for (const [cellId, cellTargets] of targetsByCell) {
+    if (stamp[cellId] !== generation) continue;
+    // `previous` runs target -> source; the real endpoints replace the first
+    // and last cell centres, so only the ones between them are collected.
+    const viaCells: Coordinate[] = [];
+    let cursor = previous[cellId];
+    while (cursor >= 0 && cursor !== startId) {
+      const cell = terrain.cellAt(Math.floor(cursor / terrain.columns), cursor % terrain.columns);
+      if (!cell) break;
+      viaCells.push(cell.coordinate);
+      cursor = previous[cursor];
+    }
+    if (cursor !== startId) continue;
+    for (const target of cellTargets) accept(target, viaCells);
   }
-  cells.reverse();
-  const rawPath = [from, ...cells.slice(1, -1).map((cell) => cell.coordinate), to];
-  const path = smoothConnectorPath(rawPath, terrain, input, graph);
-  let total = 0;
-  for (let index = 1; index < path.length; index += 1) {
-    if (!terrainSegmentAllowed(path[index - 1], path[index], graph, input)) return undefined;
-    const profile = segmentProfile(
-      path[index - 1],
-      path[index],
-      terrain,
-      input.profile,
-      "open-terrain",
-    );
-    if (!profileAllowed(profile, input)) return undefined;
-    total += profile.distanceMeters;
-  }
-  return total <= budget ? path : undefined;
+
+  return connectors;
 };
 
 class ConnectorCache {
-  private readonly values = new Map<string, Coordinate[] | null>();
+  private readonly values = new Map<string, Map<string, Coordinate[]>>();
 
+  /**
+   * Keyed by source alone, not by pair: the target list is derived
+   * deterministically from the graph and the source, so the same key always
+   * describes the same search.
+   */
   get(
-    from: Coordinate,
-    to: Coordinate,
+    source: Coordinate,
+    targets: readonly Coordinate[],
+    direction: ConnectorDirection,
     input: OSMRoutingRequest,
     terrain: TerrainModel,
     graph: Graph,
     flavor: RouteFlavor,
-  ): Coordinate[] | undefined {
-    const key = `${flavor}|${coordinateKey(from)}>${coordinateKey(to)}`;
-    if (this.values.has(key)) return this.values.get(key) ?? undefined;
-    const path = terrainConnectorPath(from, to, input, terrain, graph, flavor);
-    this.values.set(key, path ?? null);
-    return path;
+  ): Map<string, Coordinate[]> {
+    const key = `${flavor}|${direction}|${coordinateKey(source)}`;
+    const cached = this.values.get(key);
+    if (cached) return cached;
+    const paths = terrainConnectorPaths(source, targets, direction, input, terrain, graph, flavor);
+    this.values.set(key, paths);
+    return paths;
   }
 }
 
@@ -1032,9 +1079,32 @@ const searchNetwork = (
   const startConnectorPaths = new Map<number, Coordinate[]>();
   const heap = new MinHeap();
 
+  // Both ends need a connector per candidate node, and each end shares its
+  // other endpoint, so two searches cover what used to take four dozen.
+  const startConnectors = connectors.get(
+    origin,
+    startIds.map((nodeId) => graph.nodes[nodeId].coordinate),
+    "from-source",
+    input,
+    terrain,
+    graph,
+    flavor,
+  );
+  const endConnectors = destination
+    ? connectors.get(
+      destination,
+      goalIds.map((nodeId) => graph.nodes[nodeId].coordinate),
+      "to-source",
+      input,
+      terrain,
+      graph,
+      flavor,
+    )
+    : undefined;
+
   for (const nodeId of startIds) {
     const node = graph.nodes[nodeId];
-    const connector = connectors.get(origin, node.coordinate, input, terrain, graph, flavor);
+    const connector = startConnectors.get(coordinateKey(node.coordinate));
     if (!connector) continue;
     const initialCost = connectorCost(connector, input, terrain, flavor);
     if (initialCost < costs[nodeId]) {
@@ -1053,8 +1123,8 @@ const searchNetwork = (
     if (current.cost > bestCost) break;
     const currentNode = graph.nodes[current.node];
     if (goalSet.has(current.node)) {
-      const finalConnector = destination
-        ? connectors.get(currentNode.coordinate, destination, input, terrain, graph, flavor)
+      const finalConnector = endConnectors
+        ? endConnectors.get(coordinateKey(currentNode.coordinate))
         : [currentNode.coordinate];
       if (finalConnector) {
         const finalCost = current.cost + connectorCost(finalConnector, input, terrain, flavor);
