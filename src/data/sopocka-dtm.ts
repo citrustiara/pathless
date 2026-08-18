@@ -13,7 +13,7 @@ let cached: Promise<ElevationGrid> | undefined;
 /**
  * The Sopocka area's real terrain, baked from GUGiK's national LIDAR survey
  * (see scripts/import-dtm.mjs for why this is baked rather than fetched
- * live). The snapshot is ~6.6 MB, so it's a dynamic import: it loads as its
+ * live). The snapshot is ~11.7 MB, so it's a dynamic import: it loads as its
  * own chunk instead of bloating the main bundle every visitor has to parse
  * before the app can render at all, and only fetches once something
  * actually asks for it.

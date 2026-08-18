@@ -6,7 +6,7 @@ The guiding rule is that the engine does not score what it cannot measure. Eleva
 
 ## What the prototype does
 
-- Loads a real elevation model for the working area from the public [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) and resamples it to roughly 12 m spacing.
+- Loads a real elevation model for the working area from GUGiK's national LIDAR survey (NMT), resampled to 3 m spacing. The public [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) remain the fallback for areas the LIDAR snapshot does not cover.
 - Draws that elevation as contour lines and a shaded relief, computed in the browser from the same grid the router uses. A hypsometric colour tint is offered as a separate layer, because unlike the relief it replaces the base map's own land-cover colours rather than adding to them.
 - Routes over a checked-in OpenStreetMap snapshot of Sopocka, joining mapped ways with connectors searched across a 5 m terrain grid. Each off-trail step may reach up to two cells, which gives the search 16 headings rather than the 8 a plain neighbour grid allows, so a line that does not happen to run at a multiple of 45 degrees comes out as that line instead of as a staircase approximating it.
 - Costs every metre as estimated travel time, from a normalised Tobler hiking curve applied to the real local grade, scaled by the way's mapped surface and by the chosen travel style.
@@ -40,7 +40,7 @@ differs.
 
 - **[BRouter](https://brouter.de/brouter/)** is the established off-road router
   over OSM. It reads SRTM at its original 90 m spacing and low-pass filters it.
-  This engine measures grade against a 2 m LIDAR grid sampled every 4 m, so a
+  This engine measures grade against a 3 m LIDAR grid sampled every 4 m, so a
   short bank trips the grade cap here and would be averaged away there.
 - **[Skitourenguru](https://www.skitourenguru.com/)** routes across open alpine
   ground, which is the closest thing to the problem this solves. It runs
@@ -93,7 +93,7 @@ OSM snapshot ──► routing graph ─────┴─► TerrainModel ─�
 ```
 
 - [`src/engine/elevation.ts`](src/engine/elevation.ts) fetches and decodes terrarium tiles into a latitude/longitude-regular grid, and derives contour polylines with marching squares.
-- [`src/engine/terrain.ts`](src/engine/terrain.ts) lays a 5 m routing grid over the area, filling it with elevation, slope, a terrain ruggedness index, and proximity to mapped watercourses. Slope is measured on the elevation source's own grid and then aggregated per cell as both a mean and a maximum, not fitted across the routing step: over this area, measuring at a 25 m stride left a thousand cells reading as gentle ground while holding a slope past 20 degrees somewhere inside them.
+- [`src/engine/terrain.ts`](src/engine/terrain.ts) lays a 5 m routing grid over the area, filling it with elevation, slope, a terrain ruggedness index, and proximity to mapped watercourses. Slope is measured on the elevation source's own grid and then aggregated per cell as both a mean and a maximum, not fitted across the routing step: over this area, measuring at a 25 m stride left a thousand cells reading as gentle ground while holding a slope past 20 degrees somewhere inside them. The grid is 1.58 million cells and lives in parallel typed arrays at 20 bytes each; one object per cell would want about 388 MB.
 - [`src/engine/osm-router.ts`](src/engine/osm-router.ts) builds the way graph, derives street-crossing evidence from where paths and roads actually intersect, holds the mapped barriers and their gates as a separate layer that off-trail lines may not cross, and searches the combined network.
 - [`scripts/sopocka.overpass`](scripts/sopocka.overpass) is the query behind the snapshot, and [`scripts/import-osm.mjs`](scripts/import-osm.mjs) bakes its response.
 - [`src/engine/geo.ts`](src/engine/geo.ts) holds the small-area geodesy shared by all of the above.
@@ -104,7 +104,7 @@ If the terrain tiles cannot be reached, the terrain model reports `hasElevation:
 
 ## Imported area
 
-The map covers the Sopocka forest area near Gdynia, Poland, bounded by 54.445–54.470 latitude and 18.480–18.535 longitude. OSM ways are stored as `[latitude, longitude]` pairs. The snapshot can be regenerated from an Overpass response with [`scripts/import-osm.mjs`](scripts/import-osm.mjs).
+The map covers the Sopocka forest and the ground around it, between Gdynia and Sopot, Poland: 54.4325–54.4825 latitude and 18.4525–18.5625 longitude, about 5.6 by 7.1 km. OSM ways are stored as `[latitude, longitude]` pairs. The snapshot can be regenerated from an Overpass response with [`scripts/import-osm.mjs`](scripts/import-osm.mjs).
 
 ## Data and adapter direction
 

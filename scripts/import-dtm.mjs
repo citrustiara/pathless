@@ -25,8 +25,8 @@ const OUTPUT_PATH = "src/data/sopocka-dtm.json";
 
 const WCS_BASE = "https://mapy.geoportal.gov.pl/wss/service/PZGIK/NMT/GRID1/WCS/DigitalTerrainModel";
 const COVERAGE = "DTM_PL-EVRF2007-NH";
-/** Target ground sampling distance. Native LIDAR-derived NMT is 1 m; this stays comfortably below the ~10 km² per request the service tolerates before it gets unreliable. */
-const TARGET_SPACING_METERS = 2;
+/** Target ground sampling distance. Native LIDAR-derived NMT is 1 m. The router samples elevation every 4 m over a 5 m grid, so 3 m is still finer than anything that reads it, and it keeps a ~40 km² area to a download a browser can stomach. */
+const TARGET_SPACING_METERS = 3;
 /** Split the bbox into tiles no larger than this, so one flaky request only costs a retry of a few seconds, not the whole area. */
 const MAX_TILE_METERS = 1100;
 const FETCH_TIMEOUT_MS = 45_000;
