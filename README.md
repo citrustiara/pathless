@@ -8,7 +8,7 @@ The guiding rule is that the engine does not score what it cannot measure. Eleva
 
 - Loads a real elevation model for the working area from the public [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) and resamples it to roughly 12 m spacing.
 - Draws that elevation as contour lines and a shaded relief, computed in the browser from the same grid the router uses. A hypsometric colour tint is offered as a separate layer, because unlike the relief it replaces the base map's own land-cover colours rather than adding to them.
-- Routes over a checked-in OpenStreetMap snapshot of Sopocka, joining mapped ways with A\* connectors across the terrain grid.
+- Routes over a checked-in OpenStreetMap snapshot of Sopocka, joining mapped ways with connectors searched across a 5 m terrain grid. Each off-trail step may reach up to two cells, which gives the search 16 headings rather than the 8 a plain neighbour grid allows, so a line that does not happen to run at a multiple of 45 degrees comes out as that line instead of as a staircase approximating it.
 - Costs every metre as estimated travel time, from a normalised Tobler hiking curve applied to the real local grade, scaled by the way's mapped surface and by the chosen travel style.
 - Enforces limits that mean something on the ground: a maximum grade along the route, a maximum length for any single off-trail stretch, and explicit permissions for crossing streets, walking along streets, and entering mapped watercourses.
 - Offers up to three honestly labelled options: balanced, most direct, and stay-on-trails. Objectives that agree on the same line are offered once, not relabelled.
@@ -16,6 +16,20 @@ The guiding rule is that the engine does not score what it cannot measure. Eleva
 - Exports GPX and GeoJSON with elevation, and keeps the full request in the URL so a route can be shared or reloaded.
 
 The OSM snapshot is real map data, but it does not prove that a way is open, legal, safe, or passable today. A route across unmapped land is a suggestion to investigate, never navigation advice.
+
+### Why routes bend the way they do
+
+Nothing in the engine has a rule about switchbacks. Height gained per minute is
+grade times speed, and for the normalised Tobler curve the router already used
+that product peaks at a grade of 1/3.5 — 28.6%, or 15.9 degrees. Past that, a
+traverse reaches a point above you sooner than the direct line does. Llobera &
+Sluckin (2007) derive the same threshold at 16 degrees from metabolic cost,
+independently of Tobler.
+
+So the preference was always in the cost function; what suppressed it was the
+grid. Given a fall line of 57% and a ceiling of 90% — nothing forbidding the
+direct climb — the router now settles at about 27%. A grade penalty layered on
+top would double-count a calibration that is already right.
 
 ## Run locally
 
@@ -41,7 +55,7 @@ OSM snapshot ──► routing graph ─────┴─► TerrainModel ─�
 ```
 
 - [`src/engine/elevation.ts`](src/engine/elevation.ts) fetches and decodes terrarium tiles into a latitude/longitude-regular grid, and derives contour polylines with marching squares.
-- [`src/engine/terrain.ts`](src/engine/terrain.ts) lays a 25 m routing grid over the area, filling it with elevation, Horn-method slope, a terrain ruggedness index, and proximity to mapped watercourses.
+- [`src/engine/terrain.ts`](src/engine/terrain.ts) lays a 5 m routing grid over the area, filling it with elevation, slope, a terrain ruggedness index, and proximity to mapped watercourses. Slope is measured on the elevation source's own grid and then aggregated per cell as both a mean and a maximum, not fitted across the routing step: over this area, measuring at a 25 m stride left a thousand cells reading as gentle ground while holding a slope past 20 degrees somewhere inside them.
 - [`src/engine/osm-router.ts`](src/engine/osm-router.ts) builds the way graph, derives street-crossing evidence from where paths and roads actually intersect, and searches the combined network.
 - [`src/engine/geo.ts`](src/engine/geo.ts) holds the small-area geodesy shared by all of the above.
 
