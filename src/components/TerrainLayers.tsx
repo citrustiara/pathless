@@ -4,9 +4,12 @@ import { useMap } from "react-leaflet";
 import { buildContours, smoothGrid, type ElevationGrid } from "../engine";
 
 /**
- * Hypsometric tint plus a shaded relief, both computed from the elevation grid
- * and drawn once into a single raster. Rendering it as an image keeps the map
- * responsive; the vector contours on top carry the precision.
+ * Three ways of drawing the same elevation grid.
+ *
+ * The relief is a neutral grey raster blended with soft-light, so it adds depth
+ * without touching the base map's own land-cover colours. The hypsometric tint
+ * is a separate, optional layer precisely because it *does* replace them. The
+ * contours are vectors, so they stay sharp at every zoom.
  */
 
 type LayerProps = {
@@ -14,18 +17,21 @@ type LayerProps = {
   visible: boolean;
 };
 
-/**
- * Hypsometric ramp, low ground to high ground. The stops are deliberately
- * light: this layer multiplies over the base map, so a saturated ramp would
- * flatten the map's own colours instead of adding relief to them. The depth
- * comes from the hillshade below, not from the hue.
- */
+const AZIMUTH = (315 * Math.PI) / 180;
+const SUN_ALTITUDE = (46 * Math.PI) / 180;
+/** What flat ground returns, and so the value that must map to neutral grey. */
+const FLAT_SHADE = Math.sin(SUN_ALTITUDE);
+/** This terrain is gentle enough that the relief needs the help. */
+const RELIEF_EXAGGERATION = 2.8;
+const RELIEF_CONTRAST = 1.15;
+
+/** Hypsometric ramp, low ground to high ground. */
 const RAMP: Array<[number, [number, number, number]]> = [
-  [0, [186, 208, 196]],
-  [0.3, [200, 212, 190]],
-  [0.6, [216, 212, 186]],
-  [0.82, [222, 205, 178]],
-  [1, [218, 192, 170]],
+  [0, [96, 148, 118]],
+  [0.26, [148, 180, 124]],
+  [0.5, [200, 204, 142]],
+  [0.72, [224, 202, 152]],
+  [1, [198, 160, 130]],
 ];
 
 const rampColor = (position: number): [number, number, number] => {
@@ -45,14 +51,17 @@ const rampColor = (position: number): [number, number, number] => {
   return RAMP[RAMP.length - 1][1];
 };
 
-const AZIMUTH = (315 * Math.PI) / 180;
-const SUN_ALTITUDE = (46 * Math.PI) / 180;
-/** Vertical exaggeration; this terrain is gentle enough to need the help. */
-const RELIEF_EXAGGERATION = 2.6;
+const clamp01 = (value: number): number => Math.min(1, Math.max(0, value));
 
-const renderTerrainRaster = (grid: ElevationGrid, scale: number): string => {
-  const width = Math.min(1_400, Math.round(grid.columns * scale));
-  const height = Math.min(1_400, Math.round(grid.rows * scale));
+type RasterOptions = {
+  scale: number;
+  /** Colour by elevation instead of producing a neutral relief. */
+  hypsometric: boolean;
+};
+
+const renderRaster = (grid: ElevationGrid, options: RasterOptions): string => {
+  const width = Math.min(1_400, Math.round(grid.columns * options.scale));
+  const height = Math.min(1_400, Math.round(grid.rows * options.scale));
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
@@ -61,6 +70,7 @@ const renderTerrainRaster = (grid: ElevationGrid, scale: number): string => {
 
   const image = context.createImageData(width, height);
   const relief = Math.max(1, grid.maxElevation - grid.minElevation);
+  // Fade the border so the working area does not read as a pasted-on box.
   const featherX = Math.max(1, width * 0.035);
   const featherY = Math.max(1, height * 0.035);
   const metersPerPixelX = (grid.longitudeStep * grid.columns * 111_132 *
@@ -74,7 +84,22 @@ const renderTerrainRaster = (grid: ElevationGrid, scale: number): string => {
 
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
-      const centre = heightAt(x, y);
+      const offset = (y * width + x) * 4;
+      const edge = Math.min(
+        x / featherX, (width - 1 - x) / featherX,
+        y / featherY, (height - 1 - y) / featherY,
+        1,
+      );
+      image.data[offset + 3] = Math.round(255 * edge);
+
+      if (options.hypsometric) {
+        const [red, green, blue] = rampColor((heightAt(x, y) - grid.minElevation) / relief);
+        image.data[offset] = red;
+        image.data[offset + 1] = green;
+        image.data[offset + 2] = blue;
+        continue;
+      }
+
       const dzdx = (heightAt(Math.min(x + 1, width - 1), y) - heightAt(Math.max(x - 1, 0), y)) /
         (2 * metersPerPixelX) * RELIEF_EXAGGERATION;
       const dzdy = (heightAt(x, Math.min(y + 1, height - 1)) - heightAt(x, Math.max(y - 1, 0))) /
@@ -86,20 +111,12 @@ const renderTerrainRaster = (grid: ElevationGrid, scale: number): string => {
         Math.sin(SUN_ALTITUDE) * Math.cos(slope) +
           Math.cos(SUN_ALTITUDE) * Math.sin(slope) * Math.cos(AZIMUTH - aspect),
       );
-      // A wider lighting range gives the relief its depth; the base map keeps
-      // its own colours because the ramp above barely tints.
-      const lighting = 0.6 + shade * 0.74;
-      const [red, green, blue] = rampColor((centre - grid.minElevation) / relief);
-      const edge = Math.min(
-        x / featherX, (width - 1 - x) / featherX,
-        y / featherY, (height - 1 - y) / featherY,
-        1,
-      );
-      const offset = (y * width + x) * 4;
-      image.data[offset] = Math.min(255, red * lighting);
-      image.data[offset + 1] = Math.min(255, green * lighting);
-      image.data[offset + 2] = Math.min(255, blue * lighting);
-      image.data[offset + 3] = Math.round(255 * edge);
+      // Mid grey leaves the base map untouched under soft-light; ground facing
+      // away from the sun goes darker, ground facing it goes lighter.
+      const grey = clamp01(0.5 + (shade - FLAT_SHADE) * RELIEF_CONTRAST) * 255;
+      image.data[offset] = grey;
+      image.data[offset + 1] = grey;
+      image.data[offset + 2] = grey;
     }
   }
 
@@ -107,17 +124,23 @@ const renderTerrainRaster = (grid: ElevationGrid, scale: number): string => {
   return canvas.toDataURL("image/png");
 };
 
-export function ElevationTintLayer({ grid, visible }: LayerProps) {
+const useRasterOverlay = (
+  grid: ElevationGrid,
+  visible: boolean,
+  className: string,
+  opacity: number,
+  hypsometric: boolean,
+): null => {
   const map = useMap();
   const dataUrl = useMemo(
-    () => (grid.rows > 2 ? renderTerrainRaster(grid, 2) : ""),
-    [grid],
+    () => (grid.rows > 2 ? renderRaster(grid, { scale: 2, hypsometric }) : ""),
+    [grid, hypsometric],
   );
 
   useEffect(() => {
     if (!visible || !dataUrl) return;
-    // The grid stores sample points, so the image rectangle reaches half a
-    // step further out in every direction.
+    // The grid holds sample points, so the image rectangle reaches half a step
+    // further out in every direction.
     const halfLatitude = grid.latitudeStep / 2;
     const halfLongitude = grid.longitudeStep / 2;
     const overlay = L.imageOverlay(
@@ -126,14 +149,22 @@ export function ElevationTintLayer({ grid, visible }: LayerProps) {
         [grid.bounds.south - halfLatitude, grid.bounds.west - halfLongitude],
         [grid.bounds.north + halfLatitude, grid.bounds.east + halfLongitude],
       ],
-      { opacity: 0.62, interactive: false, className: "elevation-tint-overlay", pane: "tilePane" },
+      { opacity, interactive: false, className, pane: "tilePane" },
     ).addTo(map);
     return () => {
       overlay.remove();
     };
-  }, [dataUrl, grid, map, visible]);
+  }, [className, dataUrl, grid, map, opacity, visible]);
 
   return null;
+};
+
+export function HillshadeLayer({ grid, visible }: LayerProps) {
+  return useRasterOverlay(grid, visible, "hillshade-overlay", 0.9, false);
+}
+
+export function ElevationTintLayer({ grid, visible }: LayerProps) {
+  return useRasterOverlay(grid, visible, "elevation-tint-overlay", 0.42, true);
 }
 
 type ContourLayerProps = LayerProps & {

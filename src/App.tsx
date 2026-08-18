@@ -6,7 +6,7 @@ import {
   Mountain,
   Save,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ControlsPanel } from "./components/ControlsPanel";
 import { MapCanvas, type MapLayers } from "./components/MapCanvas";
 import { RouteSummary } from "./components/RouteSummary";
@@ -29,6 +29,8 @@ import type {
 import { SOPOCKA_BOUNDS, SOPOCKA_OSM_METADATA, SOPOCKA_WATERWAYS } from "./data/sopocka";
 import {
   createTerrainModel,
+  EXPORT_MIME_TYPES,
+  exportRoute,
   loadElevationGrid,
   planOSMRoute,
   type ElevationGrid,
@@ -52,7 +54,9 @@ const INITIAL_SETTINGS: RouteSettings = {
   avoidWater: false,
   showAlternatives: true,
 };
-const INITIAL_LAYERS: MapLayers = { tint: true, contours: true, paths: true };
+// Relief and contours read over the base map; the hypsometric tint replaces
+// its land-cover colours, so it is offered rather than assumed.
+const INITIAL_LAYERS: MapLayers = { hillshade: true, tint: false, contours: true, paths: true };
 
 /** The routing grid never changes shape, only the elevation poured into it. */
 const buildTerrain = (elevation?: ElevationGrid): TerrainModel => createTerrainModel({
@@ -215,51 +219,11 @@ const writeStateToUrl = (state: PersistedState): void => {
 };
 
 const downloadRoute = (format: "gpx" | "geojson", route: OSMRoute, terrain: TerrainModel): void => {
-  const points = route.coordinates.map((coordinate) => ({
-    ...coordinate,
-    ele: terrain.hasElevation ? terrain.elevationAt(coordinate) : undefined,
-  }));
-  let content: string;
-  let mimeType: string;
-  let extension: string;
-
-  if (format === "gpx") {
-    const body = points.map(({ lat, lng, ele }) =>
-      `      <trkpt lat="${lat.toFixed(6)}" lon="${lng.toFixed(6)}">${ele === undefined ? "" : `<ele>${ele.toFixed(1)}</ele>`}</trkpt>`,
-    ).join("\n");
-    content = `<?xml version="1.0" encoding="UTF-8"?>
-<gpx version="1.1" creator="Pathless" xmlns="http://www.topografix.com/GPX/1/1">
-  <metadata><name>Pathless route</name></metadata>
-  <trk><name>Pathless route</name><trkseg>
-${body}
-  </trkseg></trk>
-</gpx>`;
-    mimeType = "application/gpx+xml";
-    extension = "gpx";
-  } else {
-    content = JSON.stringify({
-      type: "Feature",
-      properties: {
-        name: "Pathless route",
-        distanceMeters: Math.round(route.distanceMeters),
-        estimatedTimeMinutes: Math.round(route.estimatedTimeMinutes),
-        ascentMeters: Math.round(route.ascentMeters),
-        descentMeters: Math.round(route.descentMeters),
-      },
-      geometry: {
-        type: "LineString",
-        coordinates: points.map(({ lat, lng, ele }) =>
-          ele === undefined ? [lng, lat] : [lng, lat, Number(ele.toFixed(1))]),
-      },
-    }, null, 2);
-    mimeType = "application/geo+json";
-    extension = "geojson";
-  }
-
-  const url = URL.createObjectURL(new Blob([content], { type: mimeType }));
+  const content = exportRoute(format, route, terrain);
+  const url = URL.createObjectURL(new Blob([content], { type: EXPORT_MIME_TYPES[format] }));
   const link = document.createElement("a");
   link.href = url;
-  link.download = `pathless-route.${extension}`;
+  link.download = `pathless-route.${format}`;
   link.click();
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
 };
@@ -294,9 +258,6 @@ export function App() {
 
   const [view, setView] = useState<RouteView>(() => buildView(request, buildTerrain()));
   const [isCalculating, setIsCalculating] = useState(false);
-  const latestRequest = useRef(request);
-  latestRequest.current = request;
-
   useEffect(() => {
     let cancelled = false;
     loadElevationGrid(SOPOCKA_BOUNDS)

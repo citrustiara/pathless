@@ -5,6 +5,8 @@ import {
   createFlatTerrainModel,
   createTerrainModel,
   distanceBetweenCoordinates,
+  routeToGeoJson,
+  routeToGpx,
   osmGraphStats,
   planOSMRoute,
   suggestContourInterval,
@@ -268,5 +270,56 @@ describe("OSM router", () => {
       ...result.routes[0].coordinates.map((point) => distanceBetweenCoordinates(point, waypoint)),
     );
     expect(nearest).toBeLessThan(30);
+  });
+});
+
+describe("export", () => {
+  const routeFor = (terrain = terrainFor()) => {
+    const route = planOSMRoute(baseRequest, terrain).routes[0];
+    expect(route).toBeDefined();
+    return route;
+  };
+
+  it("writes every point with elevation into the GPX track", () => {
+    const terrain = terrainFor();
+    const route = routeFor(terrain);
+    const gpx = routeToGpx(route, terrain);
+
+    expect(gpx.startsWith('<?xml version="1.0" encoding="UTF-8"?>')).toBe(true);
+    expect(gpx).toContain('<gpx version="1.1" creator="Pathless"');
+    expect((gpx.match(/<trkpt /g) ?? []).length).toBe(route.coordinates.length);
+    expect((gpx.match(/<ele>/g) ?? []).length).toBe(route.coordinates.length);
+    expect(gpx.trimEnd().endsWith("</gpx>")).toBe(true);
+  });
+
+  it("leaves elevation out entirely rather than writing zeroes", () => {
+    const terrain = createFlatTerrainModel(BOUNDS);
+    const route = routeFor(terrain);
+
+    expect(routeToGpx(route, terrain)).not.toContain("<ele>");
+    const geojson = JSON.parse(routeToGeoJson(route, terrain));
+    expect(geojson.geometry.coordinates.every((point: number[]) => point.length === 2)).toBe(true);
+    expect(geojson.properties.elevationSource).toBe("none");
+  });
+
+  it("writes GeoJSON in longitude, latitude, elevation order", () => {
+    const terrain = terrainFor();
+    const route = routeFor(terrain);
+    const geojson = JSON.parse(routeToGeoJson(route, terrain));
+
+    expect(geojson.type).toBe("Feature");
+    expect(geojson.geometry.type).toBe("LineString");
+    expect(geojson.geometry.coordinates).toHaveLength(route.coordinates.length);
+    const [lng, lat, ele] = geojson.geometry.coordinates[0];
+    expect(lng).toBeCloseTo(route.coordinates[0].lng, 6);
+    expect(lat).toBeCloseTo(route.coordinates[0].lat, 6);
+    expect(ele).toBeCloseTo(terrain.elevationAt(route.coordinates[0]), 0);
+    expect(geojson.properties.distanceMeters).toBe(Math.round(route.distanceMeters));
+  });
+
+  it("escapes way names taken from OSM into the GPX name", () => {
+    const terrain = terrainFor();
+    const route = { ...routeFor(terrain), wayNames: ['Droga "A" & B'] };
+    expect(routeToGpx(route, terrain)).toContain("Droga &quot;A&quot; &amp; B");
   });
 });

@@ -15,10 +15,11 @@ import { Crosshair, Layers, Minus, Plus, Maximize2, Route as RouteIcon } from "l
 import { SOPOCKA_BOUNDS, SOPOCKA_OSM_FEATURES, type OSMFeature } from "../data/sopocka";
 import type { Coordinate, ElevationGrid, OSMRoute, TerrainModel } from "../engine";
 import { suggestContourInterval } from "../engine";
-import { ContourLayer, ElevationTintLayer } from "./TerrainLayers";
+import { ContourLayer, ElevationTintLayer, HillshadeLayer } from "./TerrainLayers";
 import type { AppMode, ElevationStatus, MapPoint, PlacementMode, RouteView } from "./pathless-types";
 
 export type MapLayers = {
+  hillshade: boolean;
   tint: boolean;
   contours: boolean;
   paths: boolean;
@@ -328,6 +329,7 @@ export function MapCanvas({
 
         {elevationGrid && (
           <>
+            <HillshadeLayer grid={elevationGrid} visible={layers.hillshade} />
             <ElevationTintLayer grid={elevationGrid} visible={layers.tint} />
             <ContourLayer grid={elevationGrid} visible={layers.contours} interval={contourInterval} />
           </>
@@ -502,8 +504,9 @@ export function MapCanvas({
                 <div className="map-layer-menu">
                   <div className="map-layer-menu-title">Map layers</div>
                   {([
-                    ["tint", "Elevation shading", elevationStatus === "ready"],
+                    ["hillshade", "Shaded relief", elevationStatus === "ready"],
                     ["contours", contourInterval > 0 ? `Contours every ${contourInterval} m` : "Contour lines", elevationStatus === "ready"],
+                    ["tint", "Colour by elevation", elevationStatus === "ready"],
                     ["paths", "Paths, tracks, streams", true],
                   ] as const).map(([key, label, enabled]) => (
                     <label key={key} className={`map-layer-item ${enabled ? "" : "map-layer-item-disabled"}`}>

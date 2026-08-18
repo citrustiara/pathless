@@ -7,7 +7,7 @@ The guiding rule is that the engine does not score what it cannot measure. Eleva
 ## What the prototype does
 
 - Loads a real elevation model for the working area from the public [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) and resamples it to roughly 12 m spacing.
-- Draws that elevation as contour lines and a hypsometric tint with shaded relief, both computed in the browser from the same grid the router uses.
+- Draws that elevation as contour lines and a shaded relief, computed in the browser from the same grid the router uses. A hypsometric colour tint is offered as a separate layer, because unlike the relief it replaces the base map's own land-cover colours rather than adding to them.
 - Routes over a checked-in OpenStreetMap snapshot of Sopocka, joining mapped ways with A\* connectors across the terrain grid.
 - Costs every metre as estimated travel time, from a normalised Tobler hiking curve applied to the real local grade, scaled by the way's mapped surface and by the chosen travel style.
 - Enforces limits that mean something on the ground: a maximum grade along the route, a maximum length for any single off-trail stretch, and explicit permissions for crossing streets, walking along streets, and entering mapped watercourses.

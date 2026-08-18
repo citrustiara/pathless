@@ -9,3 +9,4 @@ export * from "./geo";
 export * from "./elevation";
 export * from "./terrain";
 export * from "./osm-router";
+export * from "./export";

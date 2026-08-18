@@ -1006,6 +1006,10 @@ kbd {
   filter: saturate(.82) contrast(.96);
 }
 
+.hillshade-overlay {
+  mix-blend-mode: soft-light;
+}
+
 .elevation-tint-overlay {
   mix-blend-mode: multiply;
 }
