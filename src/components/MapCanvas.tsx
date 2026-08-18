@@ -1,5 +1,5 @@
 import L from "leaflet";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   MapContainer,
   Marker,
@@ -11,7 +11,7 @@ import {
   useMapEvents,
 } from "react-leaflet";
 import type { LatLngBoundsExpression } from "leaflet";
-import { Crosshair, Layers, Minus, Plus, Maximize2, Route as RouteIcon } from "lucide-react";
+import { Layers, Minus, Plus, Maximize2, Route as RouteIcon } from "lucide-react";
 import { SOPOCKA_BOUNDS, SOPOCKA_OSM_FEATURES, type OSMFeature } from "../data/sopocka";
 import type { Coordinate, ElevationGrid, OSMRoute, TerrainModel } from "../engine";
 import { suggestContourInterval } from "../engine";
@@ -70,13 +70,61 @@ const featureStyle = (feature: OSMFeature) => {
   return { color: "#a35f4a", weight: 1.7, opacity: 0.6, dashArray: "3 4" };
 };
 
-const pointIcon = (kind: string, label: string) =>
-  L.divIcon({
+// Computed once: these ~1,400 features and their styles never change, so
+// giving each a stable object identity here (rather than a fresh one on
+// every MapCanvas render) keeps react-leaflet from re-styling every path on
+// the map whenever unrelated state changes, e.g. on every cursor mousemove.
+const OSM_FEATURE_STYLES = new Map(visibleOsmFeatures.map((feature) => [feature.id, featureStyle(feature)]));
+
+/**
+ * The static OSM path/track/water network, split out and memoized so it only
+ * re-renders when the "Paths, tracks, streams" layer is toggled. Left inline,
+ * this list re-rendered on every hover-driven MapCanvas update (the map's
+ * hover marker changes on every elevation-profile mousemove), which meant
+ * react-leaflet re-styled all ~1,400 polylines on every pixel of mouse
+ * movement — heavy enough to visibly drop some of those mousemove events.
+ */
+const OSMFeatureLayer = memo(function OSMFeatureLayer({ visible }: { visible: boolean }) {
+  if (!visible) return null;
+  return (
+    <>
+      {visibleOsmFeatures.map((feature) => (
+        <Polyline
+          key={feature.id}
+          positions={feature.coordinates}
+          pathOptions={OSM_FEATURE_STYLES.get(feature.id)}
+          interactive={Boolean(feature.name)}
+        >
+          {feature.name && <Tooltip sticky>{feature.name}</Tooltip>}
+        </Polyline>
+      ))}
+    </>
+  );
+});
+
+/**
+ * Icons must keep a stable identity across renders. A fresh `L.DivIcon` on
+ * every render makes react-leaflet call `marker.setIcon()`, which rebuilds
+ * the marker's DOM node — and MapCanvas re-renders on every `mousemove` (for
+ * the cursor readout), including while a marker is mid-drag. Leaflet's own
+ * Draggable handler keeps a reference to the old node through that swap and
+ * throws reading `baseVal` on its next `addClass`/`removeClass`, which aborts
+ * the drag before `dragend` ever fires. Caching by kind+label sidesteps it.
+ */
+const iconCache = new Map<string, L.DivIcon>();
+const pointIcon = (kind: string, label: string): L.DivIcon => {
+  const key = `${kind}:${label}`;
+  const cached = iconCache.get(key);
+  if (cached) return cached;
+  const icon = L.divIcon({
     className: "map-pin-wrapper",
     html: `<span class="map-pin map-pin-${kind}">${label}</span>`,
     iconSize: [22, 22],
     iconAnchor: [11, 11],
   });
+  iconCache.set(key, icon);
+  return icon;
+};
 
 const routeLatLngs = (route: OSMRoute): Array<[number, number]> =>
   route.coordinates.map(({ lat, lng }) => [lat, lng]);
@@ -302,12 +350,6 @@ export function MapCanvas({
   const primary = view.route;
   const cursorElevation = cursor && terrain.hasElevation ? terrain.elevationAt(cursor) : null;
 
-  const placementLabel = placementMode === "waypoint"
-    ? "a waypoint"
-    : placementMode === "target"
-      ? "the target"
-      : "the start";
-
   const togglePlacement = (next: Exclude<PlacementMode, null>) =>
     onPlacementModeChange(placementMode === next ? null : next);
 
@@ -347,16 +389,7 @@ export function MapCanvas({
 
         <Rectangle bounds={DATA_BOUNDS} pathOptions={{ color: "#6f8794", weight: 1, opacity: 0.4, fill: false, dashArray: "4 5" }} interactive={false} />
 
-        {layers.paths && visibleOsmFeatures.map((feature) => (
-          <Polyline
-            key={feature.id}
-            positions={feature.coordinates}
-            pathOptions={featureStyle(feature)}
-            interactive={Boolean(feature.name)}
-          >
-            {feature.name && <Tooltip sticky>{feature.name}</Tooltip>}
-          </Polyline>
-        ))}
+        <OSMFeatureLayer visible={layers.paths} />
 
         {view.alternatives.map((alternative, index) => (
           <Polyline
@@ -479,13 +512,6 @@ export function MapCanvas({
                 </button>
               ))}
             </div>
-            {placementMode && (
-              <div className="map-placement-banner">
-                <Crosshair size={13} />
-                Click the map to place {placementLabel}. It stays selected, so you can keep placing.
-                <button type="button" onClick={() => onPlacementModeChange(null)}>Done</button>
-              </div>
-            )}
           </div>
 
           <div className="overlay-corner overlay-top-right">
