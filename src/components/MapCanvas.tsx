@@ -416,7 +416,7 @@ export function MapCanvas({
           <Tooltip direction="top" offset={[0, -12]}>Start. Drag to move.</Tooltip>
         </Marker>
 
-        {waypoints.map((waypoint, index) => (
+        {mode === "design" && waypoints.map((waypoint, index) => (
           <Marker
             key={`waypoint-${index}`}
             position={[waypoint.lat, waypoint.lng]}
