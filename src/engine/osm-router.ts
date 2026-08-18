@@ -159,7 +159,6 @@ const MAX_NEAREST_PATH_NODES = 64;
 const SAMPLE_SPACING_METERS = 18;
 const SPATIAL_BUCKET_DEGREES = 0.001;
 const ROAD_CROSSING_TOLERANCE_METERS = 24;
-const ENDPOINT_TOLERANCE_METERS = 9;
 
 /** Flat-ground speed in km/h before grade and surface are applied. */
 const FLAT_SPEED_KMH: Record<ActivityProfile, number> = {
@@ -616,9 +615,11 @@ const terrainSegmentAllowed = (
   for (const road of roadCandidatesForLine(graph, from, to)) {
     const intersection = segmentIntersection(from, to, road.from, road.to);
     if (!intersection) continue;
-    const atEndpoint = distanceBetweenCoordinates(intersection, from) <= ENDPOINT_TOLERANCE_METERS ||
-      distanceBetweenCoordinates(intersection, to) <= ENDPOINT_TOLERANCE_METERS;
-    if (!atEndpoint && !input.allowStreetCrossing && !nearMappedCrossing(graph, intersection)) {
+    // No "near this segment's own endpoint" exemption here: this same check
+    // runs on every single hop of the off-trail grid search, so a blanket
+    // endpoint exemption let a multi-hop path slip across an untagged road
+    // piecemeal, one short hop at a time, without ever tripping the rule.
+    if (!input.allowStreetCrossing && !nearMappedCrossing(graph, intersection)) {
       return false;
     }
 
@@ -695,6 +696,41 @@ const edgeCost = (
   if (!edgeAllowed(edge, profile, input, graph, from, to)) return Number.POSITIVE_INFINITY;
   const waterPenalty = 1 + profile.waterRisk * (input.avoidWater ? 6 : 1.2);
   return Math.max(0.001, profile.timeMinutes * waterPenalty);
+};
+
+/**
+ * The A* search only steps cell-to-cell (8 directions on a 25 m grid), which
+ * staircases any line that isn't aligned to one of those 8 directions. Greedily
+ * skip each anchor ahead to the farthest point still reachable by one straight,
+ * allowed line — the same crossing/grade/water checks as every other segment,
+ * so a shortcut can only straighten the path, never introduce a violation the
+ * cell-by-cell search wouldn't have allowed anyway.
+ */
+const smoothConnectorPath = (
+  path: readonly Coordinate[],
+  terrain: TerrainModel,
+  input: OSMRoutingRequest,
+  graph: Graph,
+): Coordinate[] => {
+  if (path.length <= 2) return [...path];
+  const smoothed: Coordinate[] = [path[0]];
+  let anchor = 0;
+  while (anchor < path.length - 1) {
+    let next = anchor + 1;
+    for (let candidate = path.length - 1; candidate > anchor + 1; candidate -= 1) {
+      const segment = [path[anchor], path[candidate]];
+      if (
+        terrainSegmentAllowed(path[anchor], path[candidate], graph, input) &&
+        profileAllowed(pathProfile(segment, terrain, input.profile, "open-terrain"), input)
+      ) {
+        next = candidate;
+        break;
+      }
+    }
+    smoothed.push(path[next]);
+    anchor = next;
+  }
+  return smoothed;
 };
 
 const terrainConnectorPath = (
@@ -781,7 +817,8 @@ const terrainConnectorPath = (
     cursor = previous[cursor];
   }
   cells.reverse();
-  const path = [from, ...cells.slice(1, -1).map((cell) => cell.coordinate), to];
+  const rawPath = [from, ...cells.slice(1, -1).map((cell) => cell.coordinate), to];
+  const path = smoothConnectorPath(rawPath, terrain, input, graph);
   let total = 0;
   for (let index = 1; index < path.length; index += 1) {
     if (!terrainSegmentAllowed(path[index - 1], path[index], graph, input)) return undefined;
