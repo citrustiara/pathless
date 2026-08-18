@@ -45,6 +45,17 @@ const PROFILES: Array<{ id: ProfileId; label: string; detail: string; icon: type
   { id: "mtb", label: "Mountain bike", detail: "12 km/h on level trail", icon: Bike },
 ];
 
+/**
+ * What "steep" means depends on how you're travelling: a hiker can scramble
+ * up ground a bike can't ride. Each profile gets its own ceiling on the
+ * slider, and its own sane starting point when you switch to it.
+ */
+export const GRADE_LIMITS: Record<ProfileId, { min: number; max: number; default: number }> = {
+  hiker: { min: 5, max: 60, default: 35 },
+  runner: { min: 5, max: 45, default: 25 },
+  mtb: { min: 5, max: 25, default: 12 },
+};
+
 const formatCoordinate = (point: MapPoint): string =>
   `${point.lat.toFixed(5)}, ${point.lng.toFixed(5)}`;
 
@@ -281,10 +292,10 @@ export function ControlsPanel({
             label="Steepest grade"
             icon={TrendingUp}
             value={settings.maxGradePercent}
-            min={5}
-            max={60}
+            min={GRADE_LIMITS[profile].min}
+            max={GRADE_LIMITS[profile].max}
             valueLabel={`${settings.maxGradePercent}%`}
-            helpText="No part of the route may be steeper than this"
+            helpText={`No part of the route may be steeper than this — capped for ${PROFILES.find((item) => item.id === profile)?.label.toLowerCase()}`}
             onChange={(value) => patch({ maxGradePercent: value })}
           />
           <RangeControl

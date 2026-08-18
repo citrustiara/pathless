@@ -7,7 +7,7 @@ import {
   Save,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ControlsPanel } from "./components/ControlsPanel";
+import { ControlsPanel, GRADE_LIMITS } from "./components/ControlsPanel";
 import { MapCanvas, type MapLayers } from "./components/MapCanvas";
 import { RouteSummary } from "./components/RouteSummary";
 import {
@@ -28,6 +28,7 @@ import type {
 } from "./components/pathless-types";
 import { SOPOCKA_BOUNDS, SOPOCKA_OSM_METADATA, SOPOCKA_WATERWAYS } from "./data/sopocka";
 import {
+  clamp,
   createTerrainModel,
   EXPORT_MIME_TYPES,
   exportRoute,
@@ -232,7 +233,13 @@ export function App() {
   const initial = useMemo(readStateFromUrl, []);
   const [mode, setMode] = useState<AppMode>(initial.mode ?? "destination");
   const [profile, setProfile] = useState<ProfileId>(initial.profile ?? "hiker");
-  const [settings, setSettings] = useState<RouteSettings>(initial.settings ?? INITIAL_SETTINGS);
+  const [settings, setSettings] = useState<RouteSettings>(() => {
+    const loaded = initial.settings ?? INITIAL_SETTINGS;
+    // A hand-edited URL could pair a profile with a grade limit that profile
+    // doesn't allow; clamp once up front rather than trusting the link.
+    const { min, max } = GRADE_LIMITS[initial.profile ?? "hiker"];
+    return { ...loaded, maxGradePercent: clamp(loaded.maxGradePercent, min, max) };
+  });
   const [start, setStart] = useState<MapPoint>(initial.start ?? INITIAL_START);
   const [target, setTarget] = useState<MapPoint>(initial.target ?? INITIAL_TARGET);
   const [waypoints, setWaypoints] = useState<MapPoint[]>(initial.waypoints ?? []);
@@ -315,8 +322,21 @@ export function App() {
       setWaypoints((current) => (current.length < MAX_WAYPOINTS ? [...current, point] : current));
     }
     // The placement mode deliberately stays active so several points can be
-    // dropped in a row; Esc or the Done button ends it.
+    // dropped in a row; press Esc, or click the active placement button
+    // again, to stop.
   }, [mode, placementMode]);
+
+  // Steepest-grade limits are per travel style: nobody rides a bike up a
+  // 35% grade, so switching profile clamps the limit into what's realistic
+  // for it, rather than leaving a hiker's setting in place for a bike.
+  const handleProfileChange = useCallback((next: ProfileId) => {
+    setProfile(next);
+    setSettings((current) => {
+      const { min, max } = GRADE_LIMITS[next];
+      const maxGradePercent = clamp(current.maxGradePercent, min, max);
+      return maxGradePercent === current.maxGradePercent ? current : { ...current, maxGradePercent };
+    });
+  }, []);
 
   const handleMovePoint = useCallback(
     (kind: "start" | "target" | "waypoint", index: number, point: MapPoint) => {
@@ -489,7 +509,7 @@ export function App() {
               placementMode={placementMode}
               isCalculating={isCalculating}
               onModeChange={setMode}
-              onProfileChange={setProfile}
+              onProfileChange={handleProfileChange}
               onSettingsChange={setSettings}
               onPlacementModeChange={setPlacementMode}
               onClearWaypoint={(index) =>
