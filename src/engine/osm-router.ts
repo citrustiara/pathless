@@ -127,11 +127,11 @@ type RoadSegment = {
 type Graph = {
   nodes: GraphNode[];
   nodeByKey: Map<string, number>;
-  nodeIndex: Map<string, number[]>;
+  nodeIndex: Map<number, number[]>;
   roadSegments: RoadSegment[];
-  roadIndex: Map<string, RoadSegment[]>;
+  roadIndex: Map<number, RoadSegment[]>;
   crossingPoints: Coordinate[];
-  crossingIndex: Map<string, Coordinate[]>;
+  crossingIndex: Map<number, Coordinate[]>;
 };
 
 type SearchPath = {
@@ -156,15 +156,58 @@ type PathProfile = {
 
 const MAX_CONNECTOR_NODES = 24;
 const MAX_NEAREST_PATH_NODES = 64;
-const SAMPLE_SPACING_METERS = 18;
+/**
+ * The terrain source is roughly 2 m; sampling far apart means short scarps can be
+ * missed and still pass grade caps. This tighter spacing keeps short terrain
+ * breaks visible during evaluation.
+ */
+const SAMPLE_SPACING_METERS = 4;
 const SPATIAL_BUCKET_DEGREES = 0.001;
 const ROAD_CROSSING_TOLERANCE_METERS = 24;
 
-/** The headings the off-trail grid search may step in, as (row, column) offsets. */
-const CONNECTOR_DIRECTIONS = [
-  [-1, 0], [1, 0], [0, -1], [0, 1],
-  [-1, -1], [-1, 1], [1, -1], [1, 1],
-] as const;
+/**
+ * How far a single off-trail step may reach, in cells.
+ *
+ * Radius 1 is the plain 8-neighbour move set, whose headings are 45 degrees
+ * apart — that gap is what staircases every line not aligned to one of the
+ * eight. Each further ring adds finer headings: radius 2 gives 16 of them, no
+ * more than 26.6 degrees apart, and radius 3 gives 32 within 18.4 degrees.
+ * Huber & Church (1985) put worst-case path elongation at roughly 8% for 8
+ * neighbours, 2.8% by 24 offsets and 1.4% by 48, so most of the gain arrives
+ * early. Measured here, radius 3 read no straighter than radius 2 on real
+ * routes while costing twice the search, so radius 2 is where this sits.
+ */
+const CONNECTOR_STEP_CELLS = 2;
+
+const gcd = (a: number, b: number): number => {
+  let first = Math.abs(a);
+  let second = Math.abs(b);
+  while (second !== 0) {
+    const next = first % second;
+    first = second;
+    second = next;
+  }
+  return first;
+};
+
+/**
+ * The headings the search may step in, as (row, column) cell offsets.
+ *
+ * Only coprime offsets are kept: (2, 2) points exactly where (1, 1) already
+ * does, so it would cost an extra evaluation per expansion for a heading the
+ * search can reach anyway.
+ */
+const CONNECTOR_DIRECTIONS: readonly (readonly [number, number])[] = (() => {
+  const directions: (readonly [number, number])[] = [];
+  for (let rowOffset = -CONNECTOR_STEP_CELLS; rowOffset <= CONNECTOR_STEP_CELLS; rowOffset += 1) {
+    for (let columnOffset = -CONNECTOR_STEP_CELLS; columnOffset <= CONNECTOR_STEP_CELLS; columnOffset += 1) {
+      if (rowOffset === 0 && columnOffset === 0) continue;
+      if (gcd(rowOffset, columnOffset) !== 1) continue;
+      directions.push([rowOffset, columnOffset]);
+    }
+  }
+  return directions;
+})();
 
 /** Flat-ground speed in km/h before grade and surface are applied. */
 const FLAT_SPEED_KMH: Record<ActivityProfile, number> = {
@@ -245,35 +288,56 @@ const featureLayer = (feature: OSMFeature): number => {
 const isBridgeOrTunnel = (feature: OSMFeature): boolean =>
   Boolean(lower(feature.bridge) || lower(feature.tunnel));
 
-const bucketKey = (coordinate: Coordinate): string =>
-  `${Math.floor(coordinate.lat / SPATIAL_BUCKET_DEGREES)}:${Math.floor(coordinate.lng / SPATIAL_BUCKET_DEGREES)}`;
+const SPATIAL_BUCKET_KEY_OFFSET = 2_000_000;
+/**
+ * Buckets are at most low tens of thousands, so after offsetting they stay
+ * comfortably below this multiplier and still below `Number.MAX_SAFE_INTEGER` when
+ * packed.
+ */
+const SPATIAL_BUCKET_KEY_MULTIPLIER = 4_000_000;
+
+const bucketKeyFromIndices = (row: number, column: number): number =>
+  (row + SPATIAL_BUCKET_KEY_OFFSET) * SPATIAL_BUCKET_KEY_MULTIPLIER + (column + SPATIAL_BUCKET_KEY_OFFSET);
+
+const bucketKey = (coordinate: Coordinate): number =>
+  bucketKeyFromIndices(
+    Math.floor(coordinate.lat / SPATIAL_BUCKET_DEGREES),
+    Math.floor(coordinate.lng / SPATIAL_BUCKET_DEGREES),
+  );
 
 const bucketKeysForBounds = (
   minLat: number,
   maxLat: number,
   minLng: number,
   maxLng: number,
-): string[] => {
-  const keys: string[] = [];
+  visit: (key: number) => void,
+): void => {
   const startLat = Math.floor(minLat / SPATIAL_BUCKET_DEGREES);
   const endLat = Math.floor(maxLat / SPATIAL_BUCKET_DEGREES);
   const startLng = Math.floor(minLng / SPATIAL_BUCKET_DEGREES);
   const endLng = Math.floor(maxLng / SPATIAL_BUCKET_DEGREES);
   for (let lat = startLat; lat <= endLat; lat += 1) {
-    for (let lng = startLng; lng <= endLng; lng += 1) keys.push(`${lat}:${lng}`);
+    for (let lng = startLng; lng <= endLng; lng += 1) {
+      visit(bucketKeyFromIndices(lat, lng));
+    }
   }
-  return keys;
 };
 
-const segmentBounds = (from: Coordinate, to: Coordinate, padding = 0): string[] =>
+const segmentBounds = (
+  from: Coordinate,
+  to: Coordinate,
+  padding = 0,
+  visit: (key: number) => void,
+): void =>
   bucketKeysForBounds(
     Math.min(from.lat, to.lat) - padding,
     Math.max(from.lat, to.lat) + padding,
     Math.min(from.lng, to.lng) - padding,
     Math.max(from.lng, to.lng) + padding,
+    visit,
   );
 
-const addToIndex = <T>(index: Map<string, T[]>, key: string, value: T): void => {
+const addToIndex = <T>(index: Map<number, T[]>, key: number, value: T): void => {
   const bucket = index.get(key);
   if (bucket) bucket.push(value);
   else index.set(key, [value]);
@@ -323,16 +387,16 @@ const addGraphEdge = (
   target.pathEvidence ||= mappedPath;
 };
 
-const buildSegmentIndex = (segments: RoadSegment[]): Map<string, RoadSegment[]> => {
-  const index = new Map<string, RoadSegment[]>();
+const buildSegmentIndex = (segments: RoadSegment[]): Map<number, RoadSegment[]> => {
+  const index = new Map<number, RoadSegment[]>();
   for (const segment of segments) {
-    for (const key of segmentBounds(segment.from, segment.to)) addToIndex(index, key, segment);
+    segmentBounds(segment.from, segment.to, 0, (key) => addToIndex(index, key, segment));
   }
   return index;
 };
 
-const buildPointIndex = (points: Coordinate[]): Map<string, Coordinate[]> => {
-  const index = new Map<string, Coordinate[]>();
+const buildPointIndex = (points: Coordinate[]): Map<number, Coordinate[]> => {
+  const index = new Map<number, Coordinate[]>();
   for (const point of points) addToIndex(index, bucketKey(point), point);
   return index;
 };
@@ -343,26 +407,27 @@ const roadCandidatesForLine = (
   to: Coordinate,
 ): RoadSegment[] | undefined => {
   let candidates: Set<RoadSegment> | undefined;
-  for (const key of segmentBounds(from, to, 0.00015)) {
+  segmentBounds(from, to, 0.00015, (key) => {
     const bucketSegments = graph.roadIndex.get(key);
-    if (!bucketSegments || bucketSegments.length === 0) continue;
+    if (!bucketSegments || bucketSegments.length === 0) return;
     if (!candidates) candidates = new Set<RoadSegment>();
     for (const segment of bucketSegments) candidates.add(segment);
-  }
+  });
   if (!candidates) return undefined;
   return [...candidates];
 };
 
 const crossingCandidatesNear = (graph: Graph, point: Coordinate): Coordinate[] => {
   const candidates = new Set<Coordinate>();
-  for (const key of bucketKeysForBounds(
+  bucketKeysForBounds(
     point.lat - 0.0004,
     point.lat + 0.0004,
     point.lng - 0.0004,
     point.lng + 0.0004,
-  )) {
+    (key) => {
     for (const crossing of graph.crossingIndex.get(key) ?? []) candidates.add(crossing);
-  }
+    },
+  );
   return [...candidates];
 };
 
@@ -371,15 +436,15 @@ const isTaggedCrossing = (feature: OSMFeature): boolean => lower(feature.crossin
 
 const deriveCrossingPoints = (
   pathSegments: RoadSegment[],
-  roadIndex: Map<string, RoadSegment[]>,
+  roadIndex: Map<number, RoadSegment[]>,
 ): Coordinate[] => {
   const points: Coordinate[] = [];
   const seen = new Set<string>();
   for (const pathSegment of pathSegments) {
     const candidates = new Set<RoadSegment>();
-    for (const key of segmentBounds(pathSegment.from, pathSegment.to, 0.00005)) {
+    segmentBounds(pathSegment.from, pathSegment.to, 0.00005, (key) => {
       for (const road of roadIndex.get(key) ?? []) candidates.add(road);
-    }
+    });
     for (const road of candidates) {
       // A path merely touching a road in the imported data is not evidence
       // anyone may cross there; only a way OSM tags as a crossing counts.
@@ -608,12 +673,12 @@ const nearestNodeIds = (
   for (let ring = 1; ring <= 8 && found.length < limit * 2; ring += 1) {
     found.length = 0;
     const span = ring * SPATIAL_BUCKET_DEGREES;
-    for (const key of bucketKeysForBounds(
+    bucketKeysForBounds(
       coordinate.lat - span,
       coordinate.lat + span,
       coordinate.lng - span,
       coordinate.lng + span,
-    )) {
+      (key) => {
       for (const nodeId of graph.nodeIndex.get(key) ?? []) {
         if (!predicate(graph.nodes[nodeId])) continue;
         found.push({
@@ -621,7 +686,8 @@ const nearestNodeIds = (
           distance: distanceBetweenCoordinates(coordinate, graph.nodes[nodeId].coordinate),
         });
       }
-    }
+      },
+    );
   }
   return found
     .sort((a, b) => a.distance - b.distance)
@@ -671,7 +737,19 @@ const segmentProfile = (
   profile: ActivityProfile,
   surface: SurfaceClass,
 ): PathProfile => {
-  const count = Math.max(1, Math.ceil(distanceBetweenCoordinates(from, to) / SAMPLE_SPACING_METERS));
+  const totalDistance = distanceBetweenCoordinates(from, to);
+  const count = Math.max(1, Math.ceil(totalDistance / SAMPLE_SPACING_METERS));
+  const stepDistance = totalDistance / count;
+  if (stepDistance < 0.01) return {
+    distanceMeters: 0,
+    elevationChangeMeters: 0,
+    ascentMeters: 0,
+    descentMeters: 0,
+    maxGrade: 0,
+    timeMinutes: 0,
+    waterRisk: 0,
+    sideSlopeDegrees: 0,
+  };
   let distanceMeters = 0;
   let elevationChangeMeters = 0;
   let ascentMeters = 0;
@@ -692,8 +770,7 @@ const segmentProfile = (
     const fraction = sample / count;
     nextSample.lat = from.lat + deltaLat * fraction;
     nextSample.lng = from.lng + deltaLng * fraction;
-    const segmentDistance = distanceBetweenCoordinates(currentSample, nextSample);
-    if (segmentDistance < 0.01) continue;
+    const segmentDistance = stepDistance;
     const toElevation = terrain.elevationAt(nextSample);
     const elevationChange = toElevation - previousElevation;
     const grade = elevationChange / segmentDistance;
@@ -706,7 +783,9 @@ const segmentProfile = (
     maxGrade = Math.max(maxGrade, Math.abs(grade));
     timeMinutes += segmentDistance / speedMetersPerMinute(profile, grade, surface);
     waterRisk = Math.max(waterRisk, cell.waterRisk);
-    sideSlopeDegrees = Math.max(sideSlopeDegrees, cell.slopeDegrees);
+    // Use the steepest ground in crossed cells as the safety gate; mean slope
+    // can hide short, steep patches that still require protection.
+    sideSlopeDegrees = Math.max(sideSlopeDegrees, cell.maxSlopeDegrees);
 
     previousElevation = toElevation;
     currentSample.lat = nextSample.lat;
@@ -828,43 +907,6 @@ const edgeCost = (
   return Math.max(0.001, profile.timeMinutes * waterPenalty);
 };
 
-/**
- * The A* search only steps cell-to-cell (8 directions on a 25 m grid), which
- * staircases any line that isn't aligned to one of those 8 directions. Greedily
- * skip each anchor ahead to the farthest point still reachable by one straight,
- * allowed line — the same crossing/grade/water checks as every other segment,
- * so a shortcut can only straighten the path, never introduce a violation the
- * cell-by-cell search wouldn't have allowed anyway.
- */
-const smoothConnectorPath = (
-  path: readonly Coordinate[],
-  terrain: TerrainModel,
-  input: OSMRoutingRequest,
-  graph: Graph,
-): Coordinate[] => {
-  if (path.length <= 2) return [...path];
-  const smoothed: Coordinate[] = [path[0]];
-  let anchor = 0;
-  while (anchor < path.length - 1) {
-    let next = anchor + 1;
-    for (let candidate = path.length - 1; candidate > anchor + 1; candidate -= 1) {
-      if (
-        terrainSegmentAllowed(path[anchor], path[candidate], graph, input) &&
-        profileAllowed(
-          segmentProfile(path[anchor], path[candidate], terrain, input.profile, "open-terrain"),
-          input,
-        )
-      ) {
-        next = candidate;
-        break;
-      }
-    }
-    smoothed.push(path[next]);
-    anchor = next;
-  }
-  return smoothed;
-};
-
 type ConnectorDirection = "from-source" | "to-source";
 
 /**
@@ -898,10 +940,9 @@ const terrainConnectorPaths = (
 
   /** Order a candidate the way the walker travels it, then hold it to every rule. */
   const accept = (target: Coordinate, viaCells: readonly Coordinate[]): boolean => {
-    const rawPath = direction === "to-source"
+    const path = direction === "to-source"
       ? [target, ...viaCells, source]
       : [source, ...[...viaCells].reverse(), target];
-    const path = smoothConnectorPath(rawPath, terrain, input, graph);
     let total = 0;
     for (let index = 1; index < path.length; index += 1) {
       if (!terrainSegmentAllowed(path[index - 1], path[index], graph, input)) return false;
@@ -926,6 +967,7 @@ const terrainConnectorPaths = (
   // Several targets can share a cell, and one that sits in the source's own
   // cell needs no search at all.
   const targetsByCell = new Map<number, Coordinate[]>();
+  const unsettledTargets: Coordinate[] = [];
   const seen = new Set<string>();
   for (const target of targets) {
     const key = coordinateKey(target);
@@ -941,6 +983,7 @@ const terrainConnectorPaths = (
     const bucket = targetsByCell.get(cellId);
     if (bucket) bucket.push(target);
     else targetsByCell.set(cellId, [target]);
+    unsettledTargets.push(target);
   }
   if (targetsByCell.size === 0) return connectors;
 
@@ -955,23 +998,34 @@ const terrainConnectorPaths = (
   stamp[startId] = generation;
   terrainCellHeap.push(startId, 0);
 
-  // Plain Dijkstra: with many targets there is no single goal to aim a
-  // heuristic at, and the off-trail budget already bounds the frontier to a
-  // disc of that radius around the source.
-  let unsettled = targetsByCell.size;
+  // Cost-ordered with no heuristic: there is no single goal to aim one at. What
+  // bounds the frontier instead is the off-trail budget, measured against the
+  // nearest target still wanted, plus stopping as soon as every target is
+  // settled — a popped cell's cost is already final.
   while (terrainCellHeap.size > 0) {
     const currentId = terrainCellHeap.pop();
     if (currentId < 0) continue;
     if (stamp[currentId] !== generation) continue;
     if (terrainCellHeap.poppedPriority !== costs[currentId]) continue;
-    if (targetsByCell.has(currentId)) {
-      unsettled -= 1;
-      if (unsettled === 0) break;
+    const settled = targetsByCell.get(currentId);
+    if (settled) {
+      // Popped means final, so this cell's targets stop steering the frontier.
+      for (const target of settled) {
+        const index = unsettledTargets.indexOf(target);
+        if (index >= 0) unsettledTargets[index] = unsettledTargets[unsettledTargets.length - 1];
+        if (index >= 0) unsettledTargets.pop();
+      }
+      if (unsettledTargets.length === 0) break;
     }
     const row = Math.floor(currentId / terrain.columns);
     const column = currentId % terrain.columns;
     const currentCell = terrain.cellAt(row, column);
     if (!currentCell) continue;
+    let nearestTargetMeters = Number.POSITIVE_INFINITY;
+    for (const target of unsettledTargets) {
+      const straightLine = distanceBetweenCoordinates(currentCell.coordinate, target);
+      if (straightLine < nearestTargetMeters) nearestTargetMeters = straightLine;
+    }
 
     for (const [rowOffset, columnOffset] of CONNECTOR_DIRECTIONS) {
       const nextCell = terrain.cellAt(row + rowOffset, column + columnOffset);
@@ -984,6 +1038,10 @@ const terrainConnectorPaths = (
       if (!profileAllowed(profile, input)) continue;
       const nextLength = lengths[currentId] + profile.distanceMeters;
       if (nextLength > budget) continue;
+      // A step of this length can close at most that much of the gap to the
+      // nearest target still wanted, so anything already over budget by that
+      // measure can never reach one — admissible, so no reachable cell is lost.
+      if (nextLength + Math.max(0, nearestTargetMeters - profile.distanceMeters) > budget) continue;
       const nextCost = costs[currentId] + connectorStepCost(profile, input, flavor);
       if (stamp[nextId] === generation && nextCost >= costs[nextId]) continue;
       costs[nextId] = nextCost;
@@ -1017,9 +1075,9 @@ class ConnectorCache {
   private readonly values = new Map<string, Map<string, Coordinate[]>>();
 
   /**
-   * Keyed by source alone, not by pair: the target list is derived
-   * deterministically from the graph and the source, so the same key always
-   * describes the same search.
+   * Keyed by budget and direction, not flavour: changing only off-trail
+   * aversion multiplies every connector edge by the same positive constant,
+   * so it cannot change which off-trail path is cheapest.
    */
   get(
     source: Coordinate,
@@ -1030,7 +1088,8 @@ class ConnectorCache {
     graph: Graph,
     flavor: RouteFlavor,
   ): Map<string, Coordinate[]> {
-    const key = `${flavor}|${direction}|${coordinateKey(source)}`;
+    const budget = flavorSettings(input, flavor).maxOffTrailMeters;
+    const key = `${budget}|${direction}|${coordinateKey(source)}`;
     const cached = this.values.get(key);
     if (cached) return cached;
     const paths = terrainConnectorPaths(source, targets, direction, input, terrain, graph, flavor);

@@ -17,16 +17,29 @@ import {
 
 const BOUNDS: GeoBounds = { north: 54.47, south: 54.445, east: 18.535, west: 18.48 };
 
-/** A clean north-facing ramp: 0 m on the northern edge, 100 m on the southern. */
-const rampGrid = (rows = 21, columns = 21) => {
+/**
+ * A clean north-facing ramp: 0 m on the northern edge, `reliefMeters` on the
+ * southern. The working area is ~2783 m north to south, so the fall line runs
+ * at `reliefMeters / 2783`; a 100 m ramp is 3.6%, a 1000 m ramp 35.9%.
+ */
+const rampGrid = (reliefMeters = 100, rows = 21, columns = 21) => {
   const data = new Float32Array(rows * columns);
   for (let row = 0; row < rows; row += 1) {
     for (let column = 0; column < columns; column += 1) {
-      data[row * columns + column] = (row / (rows - 1)) * 100;
+      data[row * columns + column] = (row / (rows - 1)) * reliefMeters;
     }
   }
   return createElevationGrid(BOUNDS, rows, columns, data);
 };
+
+/** Compass-free heading of a segment, in degrees, measured off due east. */
+const headingDegrees = (from: Coordinate, to: Coordinate): number =>
+  (Math.atan2(to.lat - from.lat, (to.lng - from.lng) * Math.cos((54.4575 * Math.PI) / 180)) * 180) /
+  Math.PI;
+
+/** How far a heading sits from the nearest multiple of 45 degrees. */
+const offGridDegrees = (heading: number): number =>
+  Math.abs((((heading % 45) + 45 + 22.5) % 45) - 22.5);
 
 const baseRequest: OSMRoutingRequest = {
   mode: "destination",
@@ -159,13 +172,50 @@ describe("OSM router", () => {
   });
 
   it("refuses a route rather than exceeding the grade limit", () => {
-    const result = planOSMRoute({ ...baseRequest, maxGradePercent: 2 }, terrainFor());
+    // A 36% fall line with a 4% ceiling: no traverse shallow enough to obey it
+    // fits inside the off-trail budget, so refusing is the only honest answer.
+    const result = planOSMRoute(
+      { ...baseRequest, maxGradePercent: 4 },
+      terrainFor(rampGrid(1000)),
+    );
     expect(result.routes).toEqual([]);
     expect(result.errors[0]).toContain("No route satisfies");
   });
 
+  it("traverses a slope rather than refusing a cap the fall line cannot meet", () => {
+    // The ramp falls at 14.4%, so nothing running straight down it obeys an 8%
+    // ceiling. Angling across the contours does, and the router is expected to
+    // find that angle rather than give up -- with only the eight 45-degree grid
+    // headings it could not, because the shallowest of them off the contour is
+    // far too steep.
+    const result = planOSMRoute(
+      { ...baseRequest, maxGradePercent: 8 },
+      terrainFor(rampGrid(400)),
+    );
+    expect(result.routes.length).toBeGreaterThan(0);
+    expect(result.routes[0].maxGrade).toBeLessThanOrEqual(0.085);
+    expect(result.routes[0].ascentMeters + result.routes[0].descentMeters).toBeGreaterThan(0);
+  });
+
+  it("draws off-trail lines on headings the cell grid does not have", () => {
+    const result = planOSMRoute(
+      { ...baseRequest, maxGradePercent: 8, maxOffTrailMeters: 400 },
+      terrainFor(rampGrid(400)),
+    );
+    const offTrail = result.routes[0].segments
+      .filter((segment) => !segment.mappedPath && segment.distanceMeters > 1);
+    expect(offTrail.length).toBeGreaterThan(4);
+    // The first and last hop join real coordinates to cell centres, so they sit
+    // off the grid whatever the move set is. Only the cell-to-cell hops between
+    // them carry the staircase signature: every heading a multiple of 45.
+    const interior = offTrail.slice(1, -1);
+    const headings = interior.map((segment) => headingDegrees(segment.from, segment.to));
+    const offGrid = headings.filter((heading) => offGridDegrees(heading) > 2).length;
+    expect(offGrid / headings.length).toBeGreaterThan(0.25);
+  });
+
   it("never exceeds the grade limit on a route it does return", () => {
-    const result = planOSMRoute({ ...baseRequest, maxGradePercent: 25 }, terrainFor());
+    const result = planOSMRoute({ ...baseRequest, maxGradePercent: 25 }, terrainFor(rampGrid(400)));
     expect(result.routes.length).toBeGreaterThan(0);
     expect(result.routes[0].maxGrade).toBeLessThanOrEqual(0.255);
   });

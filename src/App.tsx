@@ -41,7 +41,7 @@ import {
   type TerrainModel,
 } from "./engine";
 
-const ROUTING_CELL_SIZE_METERS = 25;
+const ROUTING_CELL_SIZE_METERS = 5;
 const RECALCULATE_DEBOUNCE_MS = 160;
 const MAX_WAYPOINTS = 8;
 
@@ -66,8 +66,8 @@ const buildTerrain = (elevation?: ElevationGrid): TerrainModel => createTerrainM
   elevation,
   cellSizeMeters: ROUTING_CELL_SIZE_METERS,
   waterways: SOPOCKA_WATERWAYS,
-  id: "sopocka-25m",
-  name: "Sopocka 25 m routing grid",
+  id: "sopocka-5m",
+  name: "Sopocka 5 m routing grid",
 });
 
 const toRoutingRequest = (request: RouteRequest): OSMRoutingRequest => ({

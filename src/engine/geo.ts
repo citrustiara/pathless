@@ -19,10 +19,13 @@ export const metersPerDegreeLongitude = (latitude: number): number =>
 
 /** Planar distance in metres between two nearby WGS84 coordinates. */
 export const distanceBetweenCoordinates = (a: Coordinate, b: Coordinate): number =>
-  Math.hypot(
-    (b.lng - a.lng) * metersPerDegreeLongitude((a.lat + b.lat) / 2),
-    (b.lat - a.lat) * METERS_PER_DEGREE_LATITUDE,
-  );
+  // Plain `Math.sqrt` is faster than `Math.hypot` here, and these coordinates stay
+  // in metre-scale ranges where overflow-resistance is irrelevant.
+  (() => {
+    const x = (b.lng - a.lng) * metersPerDegreeLongitude((a.lat + b.lat) / 2);
+    const y = (b.lat - a.lat) * METERS_PER_DEGREE_LATITUDE;
+    return Math.sqrt((x * x) + (y * y));
+  })();
 
 export const interpolateCoordinate = (
   from: Coordinate,
