@@ -1,7 +1,7 @@
 import L from "leaflet";
 import { useEffect, useMemo } from "react";
 import { useMap } from "react-leaflet";
-import { buildContours, smoothGrid, type ElevationGrid } from "../engine";
+import { buildContours, smoothGrid, type Coordinate, type ElevationGrid } from "../engine";
 
 /**
  * Three ways of drawing the same elevation grid.
@@ -64,10 +64,65 @@ const rampColor = (position: number): [number, number, number] => {
 
 const clamp01 = (value: number): number => Math.min(1, Math.max(0, value));
 
+/** How far off the route counts as "close enough" to shape the tint's colour range. */
+const TINT_FOCUS_BUFFER_METERS = 150;
+
+/**
+ * Elevation range within `bufferMeters` of every point in `coordinates`'s
+ * bounding box, rather than the whole grid's. A route only ever covers a
+ * sliver of Sopocka's full ~110 m of relief, so stretching the ramp to the
+ * *route's* local relief instead makes every rise and dip along it read as
+ * clearly as the hillside is exaggerated overall — ground far from the
+ * route is free to clip to the ramp's extremes, since it isn't what's being
+ * judged.
+ */
+const localElevationRange = (
+  grid: ElevationGrid,
+  coordinates: readonly Coordinate[] | undefined,
+  bufferMeters: number,
+): { min: number; max: number } => {
+  const fallback = { min: grid.minElevation, max: grid.maxElevation };
+  if (!coordinates || coordinates.length === 0) return fallback;
+
+  let south = Number.POSITIVE_INFINITY, north = Number.NEGATIVE_INFINITY;
+  let west = Number.POSITIVE_INFINITY, east = Number.NEGATIVE_INFINITY;
+  for (const { lat, lng } of coordinates) {
+    if (lat < south) south = lat;
+    if (lat > north) north = lat;
+    if (lng < west) west = lng;
+    if (lng > east) east = lng;
+  }
+  const latBuffer = bufferMeters / 111_320;
+  const lngBuffer = bufferMeters / (111_320 * Math.cos(((north + south) / 2) * (Math.PI / 180)));
+  const rowFor = (lat: number): number =>
+    Math.min(Math.max(Math.round((grid.bounds.north - lat) / grid.latitudeStep), 0), grid.rows - 1);
+  const columnFor = (lng: number): number =>
+    Math.min(Math.max(Math.round((lng - grid.bounds.west) / grid.longitudeStep), 0), grid.columns - 1);
+  const rowStart = rowFor(north + latBuffer);
+  const rowEnd = rowFor(south - latBuffer);
+  const columnStart = columnFor(west - lngBuffer);
+  const columnEnd = columnFor(east + lngBuffer);
+
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (let row = rowStart; row <= rowEnd; row += 1) {
+    for (let column = columnStart; column <= columnEnd; column += 1) {
+      const value = grid.data[row * grid.columns + column];
+      if (value < min) min = value;
+      if (value > max) max = value;
+    }
+  }
+  // A degenerate window (a single-point route, or one narrower than a cell)
+  // falls back rather than dividing by a near-zero span.
+  return Number.isFinite(min) && Number.isFinite(max) && max - min >= 1 ? { min, max } : fallback;
+};
+
 type RasterOptions = {
   scale: number;
   /** Colour by elevation instead of producing a neutral relief. */
   hypsometric: boolean;
+  /** Overrides the grid's own min/max for the hypsometric ramp. */
+  elevationRange?: { min: number; max: number };
 };
 
 const renderRaster = (grid: ElevationGrid, options: RasterOptions): string => {
@@ -80,7 +135,9 @@ const renderRaster = (grid: ElevationGrid, options: RasterOptions): string => {
   if (!context) return "";
 
   const image = context.createImageData(width, height);
-  const relief = Math.max(1, grid.maxElevation - grid.minElevation);
+  const rangeMin = options.elevationRange?.min ?? grid.minElevation;
+  const rangeMax = options.elevationRange?.max ?? grid.maxElevation;
+  const relief = Math.max(1, rangeMax - rangeMin);
   // Fade the border so the working area does not read as a pasted-on box.
   const featherX = Math.max(1, width * 0.035);
   const featherY = Math.max(1, height * 0.035);
@@ -104,7 +161,7 @@ const renderRaster = (grid: ElevationGrid, options: RasterOptions): string => {
       image.data[offset + 3] = Math.round(255 * edge);
 
       if (options.hypsometric) {
-        const position = (heightAt(x, y) - grid.minElevation) / relief;
+        const position = (heightAt(x, y) - rangeMin) / relief;
         const stretched = clamp01(0.5 + (position - 0.5) * TINT_CONTRAST);
         const [red, green, blue] = rampColor(stretched);
         image.data[offset] = red;
@@ -143,11 +200,12 @@ const useRasterOverlay = (
   className: string,
   opacity: number,
   hypsometric: boolean,
+  elevationRange?: { min: number; max: number },
 ): null => {
   const map = useMap();
   const dataUrl = useMemo(
-    () => (grid.rows > 2 ? renderRaster(grid, { scale: 2, hypsometric }) : ""),
-    [grid, hypsometric],
+    () => (grid.rows > 2 ? renderRaster(grid, { scale: 2, hypsometric, elevationRange }) : ""),
+    [grid, hypsometric, elevationRange],
   );
 
   useEffect(() => {
@@ -176,8 +234,17 @@ export function HillshadeLayer({ grid, visible }: LayerProps) {
   return useRasterOverlay(grid, visible, "hillshade-overlay", 0.9, false);
 }
 
-export function ElevationTintLayer({ grid, visible }: LayerProps) {
-  return useRasterOverlay(grid, visible, "elevation-tint-overlay", 0.58, true);
+type ElevationTintLayerProps = LayerProps & {
+  /** Typically the current route: shapes the tint's colour range to the terrain around it. */
+  focusCoordinates?: readonly Coordinate[];
+};
+
+export function ElevationTintLayer({ grid, visible, focusCoordinates }: ElevationTintLayerProps) {
+  const elevationRange = useMemo(
+    () => localElevationRange(grid, focusCoordinates, TINT_FOCUS_BUFFER_METERS),
+    [grid, focusCoordinates],
+  );
+  return useRasterOverlay(grid, visible, "elevation-tint-overlay", 0.58, true, elevationRange);
 }
 
 type ContourLayerProps = LayerProps & {

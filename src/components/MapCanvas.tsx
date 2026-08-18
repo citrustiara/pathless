@@ -372,7 +372,7 @@ export function MapCanvas({
         {elevationGrid && (
           <>
             <HillshadeLayer grid={elevationGrid} visible={layers.hillshade} />
-            <ElevationTintLayer grid={elevationGrid} visible={layers.tint} />
+            <ElevationTintLayer grid={elevationGrid} visible={layers.tint} focusCoordinates={primary?.coordinates} />
             <ContourLayer grid={elevationGrid} visible={layers.contours} interval={contourInterval} />
           </>
         )}
