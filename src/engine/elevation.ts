@@ -130,6 +130,35 @@ const sampleMosaic = (mosaic: TileMosaic, pixelX: number, pixelY: number): numbe
   );
 };
 
+/** The plain-data fields a bilinear lookup needs — also what a Worker gets, since a live `ElevationGrid`'s `sample` closure can't cross postMessage. */
+export type RawElevationSource = {
+  readonly bounds: GeoBounds;
+  readonly rows: number;
+  readonly columns: number;
+  readonly data: Float32Array;
+  readonly latitudeStep: number;
+  readonly longitudeStep: number;
+};
+
+/** Bilinear sample, clamped to the grid edges. The one lookup formula, shared by `ElevationGrid.sample` and by `terrain.ts` (which also runs it inside a Worker, on plain data with no `sample` method attached). */
+export const sampleElevationData = (source: RawElevationSource, lat: number, lng: number): number => {
+  const { bounds, rows, columns, data, latitudeStep, longitudeStep } = source;
+  const rowPosition = clamp((bounds.north - lat) / latitudeStep, 0, rows - 1);
+  const columnPosition = clamp((lng - bounds.west) / longitudeStep, 0, columns - 1);
+  const row0 = Math.floor(rowPosition);
+  const column0 = Math.floor(columnPosition);
+  const row1 = Math.min(row0 + 1, rows - 1);
+  const column1 = Math.min(column0 + 1, columns - 1);
+  const fr = rowPosition - row0;
+  const fc = columnPosition - column0;
+  return (
+    data[row0 * columns + column0] * (1 - fc) * (1 - fr) +
+    data[row0 * columns + column1] * fc * (1 - fr) +
+    data[row1 * columns + column0] * (1 - fc) * fr +
+    data[row1 * columns + column1] * fc * fr
+  );
+};
+
 const buildGrid = (
   bounds: GeoBounds,
   rows: number,
@@ -147,7 +176,7 @@ const buildGrid = (
     if (value > maxElevation) maxElevation = value;
   }
 
-  return {
+  const grid: Omit<ElevationGrid, "sample"> = {
     bounds,
     rows,
     columns,
@@ -158,23 +187,9 @@ const buildGrid = (
     maxElevation: Number.isFinite(maxElevation) ? maxElevation : 0,
     attribution,
     sourceUrl,
-    sample(lat: number, lng: number): number {
-      const rowPosition = clamp((bounds.north - lat) / latitudeStep, 0, rows - 1);
-      const columnPosition = clamp((lng - bounds.west) / longitudeStep, 0, columns - 1);
-      const row0 = Math.floor(rowPosition);
-      const column0 = Math.floor(columnPosition);
-      const row1 = Math.min(row0 + 1, rows - 1);
-      const column1 = Math.min(column0 + 1, columns - 1);
-      const fr = rowPosition - row0;
-      const fc = columnPosition - column0;
-      return (
-        data[row0 * columns + column0] * (1 - fc) * (1 - fr) +
-        data[row0 * columns + column1] * fc * (1 - fr) +
-        data[row1 * columns + column0] * (1 - fc) * fr +
-        data[row1 * columns + column1] * fc * fr
-      );
-    },
   };
+
+  return { ...grid, sample: (lat: number, lng: number) => sampleElevationData(grid, lat, lng) };
 };
 
 /** Wrap an existing height array as a grid. Row 0 is the northern edge. */
@@ -232,8 +247,8 @@ export const loadElevationGrid = async (
     rows,
     columns,
     data,
-    `AWS Terrain Tiles (SRTM, EU-DEM), ~${Math.round(spacing)} m grid`,
-    "https://registry.opendata.aws/terrain-tiles/",
+    `Mapzen Terrain Tiles on AWS Open Data (EU-DEM in this area), ~${Math.round(spacing)} m grid`,
+    "https://github.com/tilezen/joerd/blob/master/docs/attribution.md",
   );
 };
 

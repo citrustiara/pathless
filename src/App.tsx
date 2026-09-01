@@ -31,6 +31,7 @@ import { loadSopockaDtmGrid } from "./data/sopocka-dtm";
 import {
   clamp,
   createTerrainModel,
+  createTerrainModelInWorker,
   EXPORT_MIME_TYPES,
   exportRoute,
   loadElevationGrid,
@@ -264,7 +265,7 @@ export function App() {
 
   const [elevation, setElevation] = useState<ElevationGrid | undefined>();
   const [elevationStatus, setElevationStatus] = useState<ElevationStatus>("loading");
-  const terrain = useMemo(() => buildTerrain(elevation), [elevation]);
+  const [terrain, setTerrain] = useState<TerrainModel>(() => buildTerrain());
 
   const request = useMemo<RouteRequest>(
     () => ({ mode, profile, settings, start, target, waypoints }),
@@ -285,9 +286,31 @@ export function App() {
         console.warn("Baked Poland terrain unavailable, falling back to global elevation tiles.", error);
         return loadElevationGrid(SOPOCKA_BOUNDS);
       })
-      .then((grid) => {
-        if (cancelled) return;
-        setElevation(grid);
+      .then(async (grid) => {
+        if (cancelled) return null;
+        // Building the routing grid is a few hundred milliseconds of
+        // arithmetic over ~1.6 million cells — enough to freeze the tab if
+        // it ran on the main thread (worse on a slower machine or a slower
+        // JS engine), so it runs on a Worker instead. `elevation` and
+        // `terrain` are set together below, once both are ready, so the map
+        // never shows relief from one and routes against the other.
+        const builtTerrain = await createTerrainModelInWorker({
+          bounds: SOPOCKA_BOUNDS,
+          elevation: grid,
+          cellSizeMeters: ROUTING_CELL_SIZE_METERS,
+          waterways: SOPOCKA_WATERWAYS,
+          id: "sopocka-5m",
+          name: "Sopocka 5 m routing grid",
+        }).catch((error) => {
+          console.warn("Terrain worker unavailable, building the grid on the main thread instead.", error);
+          return buildTerrain(grid);
+        });
+        return { grid, builtTerrain };
+      })
+      .then((result) => {
+        if (cancelled || !result) return;
+        setElevation(result.grid);
+        setTerrain(result.builtTerrain);
         setElevationStatus("ready");
       })
       .catch(() => {
@@ -338,9 +361,13 @@ export function App() {
     if (placementMode === "waypoint" && mode === "design") {
       setWaypoints((current) => (current.length < MAX_WAYPOINTS ? [...current, point] : current));
     }
-    // The placement mode deliberately stays active so several points can be
-    // dropped in a row; press Esc, or click the active placement button
-    // again, to stop.
+    // One placement per click, then placement mode turns itself off. The
+    // map's left button is also how you pan, so leaving it armed meant an
+    // ordinary click to look around would drop (or move) the point again.
+    // Re-arm with the Place button or S/T/W for another. Dragging an
+    // existing marker is unaffected — that's its own handler in MapCanvas
+    // and never looks at placement mode.
+    if (placementMode) setPlacementMode(null);
   }, [mode, placementMode]);
 
   // Steepest-grade limits are per travel style: nobody rides a bike up a
@@ -499,7 +526,7 @@ export function App() {
           </div>
           <div className="topbar-right">
             <span className="topbar-hint">
-              <kbd>S</kbd><kbd>T</kbd><kbd>W</kbd> place points, <kbd>Esc</kbd> to stop
+              <kbd>S</kbd><kbd>T</kbd><kbd>W</kbd> to place a point, <kbd>Esc</kbd> to cancel
             </span>
             <button
               className="button button-primary button-compact"

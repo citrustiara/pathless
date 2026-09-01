@@ -8,5 +8,6 @@ export * from "./types";
 export * from "./geo";
 export * from "./elevation";
 export * from "./terrain";
+export * from "./terrain-async";
 export * from "./osm-router";
 export * from "./export";

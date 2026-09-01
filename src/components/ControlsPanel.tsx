@@ -234,7 +234,7 @@ export function ControlsPanel({
                 onClick={() => togglePlacement("waypoint")}
               >
                 <Plus size={14} />
-                {placementMode === "waypoint" ? "Click the map to add waypoints" : "Add a waypoint on the map"}
+                {placementMode === "waypoint" ? "Click the map to place it" : "Add a waypoint on the map"}
               </button>
             ) : (
               <>
@@ -251,7 +251,7 @@ export function ControlsPanel({
                     type="button"
                     onClick={() => togglePlacement("waypoint")}
                   >
-                    <Plus size={13} /> {placementMode === "waypoint" ? "Placing waypoints" : "Add waypoint"}
+                    <Plus size={13} /> {placementMode === "waypoint" ? "Click the map to place it" : "Add waypoint"}
                   </button>
                 )}
               </>
@@ -260,7 +260,8 @@ export function ControlsPanel({
         )}
         <p className="section-note">
           Drag any marker on the map to move it, or right-click the map to set a point directly.
-          Press Esc to stop placing.
+          Placing turns off after one point, so panning afterward doesn't move it again — press
+          Esc to cancel before you click, or the button again for another point.
         </p>
       </div>
 
