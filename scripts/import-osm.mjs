@@ -136,7 +136,9 @@ const outputData = {
   source: "OpenStreetMap",
   sourceUrl: "https://www.openstreetmap.org/",
   overpassUrl: "https://overpass-api.de/api/interpreter",
-  license: "OpenStreetMap contributors · ODbL",
+  license: "OpenStreetMap contributors · Open Database License (ODbL) 1.0",
+  licenseUrl: "https://opendatacommons.org/licenses/odbl/1-0/",
+  processing: "Bounded Overpass extract filtered to routing ways, barriers, openings, and the tags used by Pathless",
   importedAt: new Date().toISOString(),
   osmTimestamp: source.osm3s?.timestamp_osm_base ?? null,
   bbox: {

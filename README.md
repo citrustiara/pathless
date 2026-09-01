@@ -138,4 +138,4 @@ The project is not legal, surveying, emergency-response, or outdoor-safety advic
 
 ## License
 
-Pathless is released under the [MIT License](LICENSE). External datasets and services retain their own licenses and terms; the project license does not grant rights to third-party data.
+Pathless source code is released under the [MIT License](LICENSE). The checked-in geographic snapshots and live map/elevation services retain their own licenses and terms; the MIT license does not apply to them. See [Data sources and reuse terms](DATA_SOURCES.md) for provenance, processing, attribution, and redistribution details.
